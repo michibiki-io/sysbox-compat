@@ -5,6 +5,7 @@
 - [English](#english): [Authorization](#authorization), [Protection and limits](#protection-and-limits)
 - [日本語](#日本語): [認証](#認証), [保護と制約](#保護と制約)
 
+- [FUSE overlay targets](#fuse-overlay-targets) / [FUSE overlay 上の対象](#fuse-overlay-上の対象)
 - [Sysfs authority and limits](#sysfs-authority-and-limits) / [sysfs の権限と制約](#sysfs-の権限と制約)
 
 ## English
@@ -36,6 +37,27 @@ Backing mode is read-only and restricted to the existing virtual-net handler. It
 The synchronous alarm, parent-death signal, daemon timeout and reaper guard bound children and descriptors. Live-thread notification interruption and leader replacement are not detectable by a final pidfd poll alone. Notification and move_mount are not atomic. No full security audit, installer support or Talos compatibility is claimed before the consumer gate.
 
 A registered network protection boundary or ancestor with an existing protocol identity must remain a valid positive FUSE entry even when this caller's backing Lookup fails. Linux invalidates an expired dentry on a LOOKUP error and detaches submounts on that shared dentry in every namespace, including locked protection clones. For these policy paths only, failed Lookup returns the same protocol identity/kind with fixed read-only traversal metadata (host-root IDs, zero size; no saved network attributes). Entry/attribute TTLs stay zero. This may expose the existence of a registered policy ancestor when the caller's Network lacks it; directory enumeration, Getattr, Open, Read and Readlink still obtain and authorize the actual caller view, and missing non-policy paths retain their errors. No contents or write access are granted. Unknown identities and pre-registration paths retain the original failure. See `tests/runtime/sysfs-dentry-protection.py` for rejected deeper-User, renamed-interface and injected-failure protection retention checks.
+
+### FUSE overlay targets
+
+For a host-side mount lookup failure, the lookup worker enters the notifying
+thread's User and Mount namespaces and installs its filesystem IDs, groups, and
+effective capabilities. The daemon checks the mount ancestry against the
+thread's mount table. Procfd targets are duplicated from the task and checked
+against the expected path. Protected transfers use the authorized descriptor.
+The same-User route keeps the registered protection mounts and their attributes.
+The direct-child route also locks the protections before attachment.
+
+The existing dispatch still decides which operations need emulation. The
+fallback changes a single permitted mount attribute on a pinned descriptor.
+Old-root detachment requires the immutable-unmount option, a separate Mount
+namespace and a non-shared old root stacked on the new FUSE root. The worker
+uses the pinned old root. It leaves the normal procfs and sysfs unmount policy
+in place.
+
+`pipe-max-size` is a global kernel value. Its read path uses the trusted
+procfs directly to keep FUSE reads out of the requester's mount namespace.
+The path permits read access and rejects writes.
 
 ## 日本語
 
@@ -118,3 +140,22 @@ alarm、parent-death signal、daemon timeout、reaper guard で child と FD の
 完全な安全性監査や installer 対応を主張せず、consumer gate 前に Talos の対応完了と扱いません。
 
 登録済み network 保護の mount 境界と祖先に既存の protocol identity がある場合、要求元の backing Lookup が失敗しても、その FUSE entry は有効なまま維持します。Linux は期限切れ dentry の LOOKUP error で共有 dentry を失効させ、別 namespace の locked clone を含む配下の保護 mount を detach するためです。この policy path だけは同じ identity と種別の固定した読み取り専用 traversal metadata（host-root ID、size zero）を返し、保存した Network 属性は返しません。entry／属性 TTL は zero のままです。要求元の Network に存在しなくても登録済み policy 祖先の存在は見える場合がありますが、列挙、Getattr、Open、Read、Readlink は実際の caller view と認可を使い、policy 外の不在は元の error を維持します。内容や write 権限は与えず、未知の identity と登録前は元の失敗を返します。深い User、interface rename、失敗注入の後も外側と転送 tree の保護が残ることを `tests/runtime/sysfs-dentry-protection.py` で確認します。
+
+
+### FUSE overlay 上の対象
+
+ホスト側のパス検査が失敗した場合、検査プロセスは通知元スレッドの User・Mount
+名前空間に入り、ファイルシステム ID、グループ、実効 capability を適用します。
+デーモンは、対象マウントの親子関係を通知元のマウントテーブルで確認します。
+procfd はスレッドから複製し、想定したパスと照合します。保護付き転送には認可した FD を
+渡します。同じ User 名前空間では登録済みのマウントと属性を維持し、直接の子では
+取り付け前に保護マウントをロックします。
+
+エミュレーションの要否は既存の振り分けで判定します。代替経路でマウント属性を変更する
+場合は、許可された属性だけを保持済みの FD に適用します。旧ルートを解除できるのは、
+immutable unmount を許可しており、専用の Mount 名前空間で新しい FUSE ルートの上に
+非共有の旧ルートが重なる場合です。解除にはその FD を使います。procfs と sysfs の通常の
+解除判定は引き続き適用します。
+
+`pipe-max-size` はカーネル全体の値です。読み取りには信頼済みの procfs を使い、
+要求元の Mount 名前空間に入り直す処理を避けます。書き込みは拒否します。

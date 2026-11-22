@@ -1,0 +1,751 @@
+diff --git a/sysbox-fs/handler/implementations/procSysFs.go b/sysbox-fs/handler/implementations/procSysFs.go
+index 4f5739e..71baddd 100644
+--- a/sysbox-fs/handler/implementations/procSysFs.go
++++ b/sysbox-fs/handler/implementations/procSysFs.go
+@@ -48,6 +48,8 @@ const (
+ const (
+ 	minProtectedHardlinksVal = 0
+ 	maxProtectedHardlinksVal = 1
++
++	pipeMaxSizePath = "/proc/sys/fs/pipe-max-size"
+ )
+ 
+ type ProcSysFs struct {
+@@ -91,6 +93,11 @@ var ProcSysFs_Handler = &ProcSysFs{
+ func (h *ProcSysFs) Lookup(
+ 	n domain.IOnodeIface,
+ 	req *domain.HandlerRequest) (os.FileInfo, error) {
++	// The pipe limit is global. Namespace entry for this read can
++	// recurse into the FUSE filesystem that is waiting for the value.
++	if n.Name() == "pipe-max-size" {
++		return os.Lstat(pipeMaxSizePath)
++	}
+ 
+ 	var resource = n.Name()
+ 
+@@ -118,6 +125,16 @@ func (h *ProcSysFs) Lookup(
+ func (h *ProcSysFs) Open(
+ 	n domain.IOnodeIface,
+ 	req *domain.HandlerRequest) (bool, error) {
++	if n.Name() == "pipe-max-size" {
++		if n.OpenFlags()&(syscall.O_ACCMODE|syscall.O_TRUNC) != syscall.O_RDONLY {
++			return false, fuse.IOerror{Code: syscall.EPERM}
++		}
++		file, err := os.Open(pipeMaxSizePath)
++		if err != nil {
++			return false, err
++		}
++		return false, file.Close()
++	}
+ 
+ 	var resource = n.Name()
+ 
+@@ -144,6 +161,14 @@ func (h *ProcSysFs) Open(
+ func (h *ProcSysFs) Read(
+ 	n domain.IOnodeIface,
+ 	req *domain.HandlerRequest) (int, error) {
++	if n.Name() == "pipe-max-size" {
++		file, err := os.Open(pipeMaxSizePath)
++		if err != nil {
++			return 0, err
++		}
++		defer file.Close()
++		return file.ReadAt(req.Data, req.Offset)
++	}
+ 
+ 	var resource = n.Name()
+ 
+@@ -171,6 +196,9 @@ func (h *ProcSysFs) Read(
+ func (h *ProcSysFs) Write(
+ 	n domain.IOnodeIface,
+ 	req *domain.HandlerRequest) (int, error) {
++	if n.Name() == "pipe-max-size" {
++		return 0, fuse.IOerror{Code: syscall.EPERM}
++	}
+ 
+ 	var resource = n.Name()
+ 
+diff --git a/sysbox-fs/seccomp/fuse_target.go b/sysbox-fs/seccomp/fuse_target.go
+new file mode 100644
+index 0000000..0c5ba7f
+--- /dev/null
++++ b/sysbox-fs/seccomp/fuse_target.go
+@@ -0,0 +1,453 @@
++package seccomp
++
++import (
++	"bufio"
++	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/nestybox/sysbox-fs/sysfstransfer"
++	libseccomp "github.com/seccomp/libseccomp-golang"
++	"github.com/sirupsen/logrus"
++	"golang.org/x/sys/unix"
++)
++
++type fuseMountTarget struct {
++	file *os.File
++	path string
++}
++
++// This runs only after the ordinary lookup failed. The mount ID returned with
++// the file descriptor must identify a path on or below a fuse-overlayfs
++// mount in the notifying thread's mount table.
++func (m *mountSyscallInfo) resolveFuseMountTarget(path, raw string) (*fuseMountTarget, error) {
++	if !m.canResolveFuseTarget() {
++		return nil, nil
++	}
++	return m.syscallCtx.runFuseTargetWorker(m.notifyFd, path, raw, m.FsType, "lookup", nil)
++}
++
++// The post-pivot detach is the only unmount supported by this fallback.
++// It operates on the pinned old root FD and retains the immutable policy.
++func (u *umountSyscallInfo) detachFusePreviousRoot(notifyFD int32) (*sysResponse, bool, error) {
++	if !u.tracer.service.allowImmutableUnmounts || u.Target != "." || u.Flags != unix.MNT_DETACH {
++		return nil, false, nil
++	}
++	detached, err := u.syscallCtx.runFuseTargetWorker(notifyFD, ".", "", "", "detach", nil)
++	if err != nil {
++		return u.tracer.createErrorResponse(u.reqId, sysfstransfer.Errno(err)), true, nil
++	}
++	if detached == nil {
++		return nil, false, nil
++	}
++	return u.tracer.createSuccessResponse(u.reqId), true, nil
++}
++
++// The pinned remount worker applies the requested attribute without clearing
++// unrelated protections or resolving the target path again.
++func (m *mountSyscallInfo) setFuseMountAttribute(operation string) (*sysResponse, error) {
++	result, err := m.syscallCtx.runFuseTargetWorker(m.notifyFd, "/", "", "", operation, m.fuseTarget.file)
++	if err != nil {
++		return m.tracer.createErrorResponse(m.reqId, sysfstransfer.Errno(err)), nil
++	}
++	if result == nil {
++		return m.tracer.createErrorResponse(m.reqId, syscall.ENOENT), nil
++	}
++	return m.tracer.createSuccessResponse(m.reqId), nil
++}
++
++func (m *syscallCtx) runFuseTargetWorker(notifyFD int32, path, raw, fsType, operation string, pinned *os.File) (*fuseMountTarget, error) {
++	helper := os.Getenv("SYSBOX_PROC_TRANSFER_HELPER")
++	if helper == "" {
++		return nil, nil
++	}
++	if err := libseccomp.NotifIDValid(libseccomp.ScmpFd(notifyFD), m.reqId); err != nil {
++		return nil, err
++	}
++
++	pidfd, err := openProcRequesterPidfd(int(m.pid), unix.PidfdOpen)
++	if err != nil {
++		return nil, nil
++	}
++	files := []*os.File{os.NewFile(uintptr(pidfd), "requester pidfd")}
++	defer func() {
++		for _, file := range files {
++			file.Close()
++		}
++	}()
++	taskRoot := fmt.Sprintf("/proc/%d", m.pid)
++	taskFD, err := unix.Open(taskRoot, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer unix.Close(taskFD)
++
++	mountInfo, err := readMountRequesterFile(taskFD, "mountinfo")
++	if err != nil {
++		return nil, err
++	}
++	table, hasOverlay, err := parseFuseMountTable(mountInfo)
++	if err != nil {
++		return nil, err
++	}
++	if !hasOverlay {
++		return nil, nil
++	}
++
++	statusText, err := readMountRequesterFile(taskFD, "status")
++	if err != nil {
++		return nil, err
++	}
++	status := make(map[string][]string)
++	for _, line := range strings.Split(statusText, "\n") {
++		if name, value, ok := strings.Cut(line, ":"); ok {
++			status[name] = strings.Fields(value)
++		}
++	}
++	args := []string{"--lookup-fuse-target", "path", path, fsType}
++	procFD, directFD := fuseTargetProcFD(raw, status["Tgid"], m.pid)
++	if directFD {
++		args[1] = "fd"
++	} else if strings.HasPrefix(raw, "/proc/self/fd/") || strings.HasPrefix(raw, "/proc/thread-self/fd/") {
++		// A nonleader /proc/self lookup uses the leader's descriptor table.
++		// Never substitute the notifying thread's table for that case.
++		return nil, syscall.ENOENT
++	}
++	for _, field := range []string{"Uid", "Gid"} {
++		mappings, err := readMountRequesterFile(taskFD, strings.ToLower(field)+"_map")
++		if err != nil {
++			return nil, err
++		}
++		mapped, err := mapFuseRequesterIDs(status[field], mappings)
++		if err != nil {
++			logrus.Debugf("FUSE requester's %s map is incompatible tid=%d: %v", field, m.pid, err)
++			return nil, err
++		}
++		args = append(args, mapped...)
++	}
++	if len(status["CapEff"]) != 1 {
++		return nil, syscall.EINVAL
++	}
++	capabilities, err := strconv.ParseUint(status["CapEff"][0], 16, 64)
++	if err != nil {
++		return nil, err
++	}
++	args = append(args, strconv.FormatUint(capabilities&0xffffffff, 10), strconv.FormatUint(capabilities>>32, 10))
++	args = append(args, status["Groups"]...)
++
++	for _, path := range []string{"root", "cwd"} {
++		fd, err := unix.Openat(taskFD, path, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
++		if err != nil {
++			return nil, err
++		}
++		files = append(files, os.NewFile(uintptr(fd), "requester "+path))
++	}
++	if operation == "detach" {
++		valid, err := m.verifyPreviousRoot(taskFD, files[1], files[2], table)
++		if err != nil || !valid {
++			return nil, err
++		}
++		args[1] = "detach"
++	} else if operation != "lookup" {
++		args[1] = operation
++	}
++
++	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer unix.Close(pair[0])
++	files = append(files, os.NewFile(uintptr(pair[1]), "lookup reply"))
++	if directFD {
++		duplicate, err := unix.PidfdGetfd(pidfd, procFD, 0)
++		if err != nil {
++			return nil, err
++		}
++		files = append(files, os.NewFile(uintptr(duplicate), "requester target"))
++	} else if pinned != nil {
++		duplicate, err := unix.FcntlInt(pinned.Fd(), unix.F_DUPFD_CLOEXEC, 0)
++		if err != nil {
++			return nil, err
++		}
++		files = append(files, os.NewFile(uintptr(duplicate), "pinned FUSE target"))
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, helper, args...)
++	cmd.ExtraFiles = files
++	guard, ok := m.tracer.service.nss.(interface{ WithChildReaperGuard(func() error) error })
++	if !ok {
++		return nil, syscall.ENOTSUP
++	}
++	err = guard.WithChildReaperGuard(func() error {
++		output, err := runProcTransfer(notifyFD, m.reqId, cmd.CombinedOutput)
++		if err != nil {
++			logrus.Debugf("FUSE target lookup failed tid=%d: %v (%s)", m.pid, err, output)
++		}
++		return err
++	})
++	if err != nil {
++		var exited *exec.ExitError
++		if errors.As(err, &exited) && exited.ExitCode() > 0 {
++			return nil, syscall.Errno(exited.ExitCode())
++		}
++		return nil, err
++	}
++	if operation != "lookup" {
++		return &fuseMountTarget{}, nil
++	}
++	target, id, err := readFuseMountTarget(pair[0])
++	if err != nil {
++		return nil, err
++	}
++	if !fuseOverlayAncestor(table, id) {
++		target.file.Close()
++		return nil, nil
++	}
++	if err := libseccomp.NotifIDValid(libseccomp.ScmpFd(notifyFD), m.reqId); err != nil {
++		target.file.Close()
++		return nil, err
++	}
++	return target, nil
++}
++
++// A FUSE-root request may still have the old root as its cwd after
++// pivot_root. Verify the mount topology in a separate mount namespace.
++// A cwd at a protected proc/sys mount or a shared mount is ineligible.
++func (m *syscallCtx) verifyPreviousRoot(taskFD int, root, cwd *os.File, table map[uint64]fuseMountTableEntry) (bool, error) {
++	id, err := fuseDescriptorMountID(root)
++	if err != nil {
++		return false, err
++	}
++	if !fuseOverlayAncestor(table, id) {
++		return false, nil
++	}
++
++	var requesterNS, outerNS unix.Stat_t
++	if err := unix.Fstatat(taskFD, "ns/mnt", &requesterNS, 0); err != nil {
++		return false, err
++	}
++	outer := fmt.Sprintf("/proc/%d", m.cntr.InitPid())
++	if err := unix.Stat(outer+"/ns/mnt", &outerNS); err != nil {
++		return false, err
++	}
++	if requesterNS.Dev == outerNS.Dev && requesterNS.Ino == outerNS.Ino {
++		return false, nil
++	}
++	oldID, err := fuseDescriptorMountID(cwd)
++	if err != nil {
++		return false, err
++	}
++	// pivot_root(".", ".") stacks the previous root directly on the
++	// requester's new root. Its mountpoint in the new view is "/".
++	old, known := table[oldID]
++	if known && oldID != id && old.parent == id && old.mountpoint == "/" &&
++		old.root == "/" && !old.shared && old.filesystem != "proc" &&
++		old.filesystem != "sysfs" && !(old.filesystem == "fuse" && old.source == "sysboxfs") {
++		return true, nil
++	}
++	logrus.Debugf("FUSE previous root not eligible tid=%d root=%d cwd=%d mount=%+v present=%v", m.pid, id, oldID, old, known)
++	return false, nil
++}
++
++func fuseDescriptorMountID(file *os.File) (uint64, error) {
++	info, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", file.Fd()))
++	if err != nil {
++		return 0, err
++	}
++	for _, line := range strings.Split(string(info), "\n") {
++		if strings.HasPrefix(line, "mnt_id:") {
++			var id uint64
++			_, err := fmt.Sscanf(line, "mnt_id: %d", &id)
++			return id, err
++		}
++	}
++	return 0, syscall.EINVAL
++}
++
++type fuseMountTableEntry struct {
++	parent     uint64
++	filesystem string
++	source     string
++	root       string
++	mountpoint string
++	shared     bool
++}
++
++func parseFuseMountTable(text string) (map[uint64]fuseMountTableEntry, bool, error) {
++	table := make(map[uint64]fuseMountTableEntry)
++	hasOverlay := false
++	mounts := bufio.NewScanner(strings.NewReader(text))
++	mounts.Buffer(make([]byte, 4096), 512*1024)
++	for mounts.Scan() {
++		fields := strings.Fields(mounts.Text())
++		if len(fields) < 10 || fields[len(fields)-4] != "-" {
++			return nil, false, syscall.EINVAL
++		}
++		id, err := strconv.ParseUint(fields[0], 10, 64)
++		if err != nil {
++			return nil, false, err
++		}
++		parent, err := strconv.ParseUint(fields[1], 10, 64)
++		if err != nil {
++			return nil, false, err
++		}
++		filesystem := fields[len(fields)-3]
++		entry := fuseMountTableEntry{
++			parent: parent, filesystem: filesystem, source: fields[len(fields)-2],
++			root: fields[3], mountpoint: fields[4],
++		}
++		for _, field := range fields[6 : len(fields)-4] {
++			entry.shared = entry.shared || strings.HasPrefix(field, "shared:")
++		}
++		table[id] = entry
++		hasOverlay = hasOverlay || filesystem == "fuse.fuse-overlayfs"
++	}
++	return table, hasOverlay, mounts.Err()
++}
++
++func fuseOverlayAncestor(table map[uint64]fuseMountTableEntry, id uint64) bool {
++	for steps := 0; steps < len(table); steps++ {
++		mount, found := table[id]
++		if !found {
++			return false
++		}
++		if mount.filesystem == "fuse.fuse-overlayfs" {
++			return true
++		}
++		id = mount.parent
++	}
++	return false
++}
++
++// Proc uses the pinned descriptor. Simple bind and new mounts continue via
++// the existing dispatch rules. Exclude emulated mounts that reopen the target.
++func fuseBindAtimeOperation(flags uint64) string {
++	const bindRemount = unix.MS_BIND | unix.MS_REMOUNT
++	switch flags &^ unix.MS_REC {
++	case bindRemount | unix.MS_NOATIME:
++		return "noatime"
++	case bindRemount | unix.MS_RELATIME:
++		return "relatime"
++	case bindRemount | unix.MS_STRICTATIME:
++		return "strictatime"
++	default:
++		return ""
++	}
++}
++
++func (m *mountSyscallInfo) canResolveFuseTarget() bool {
++	mh := m.tracer.service.mts.MountHelper()
++	if mh.IsNewMount(m.Flags) && !mh.IsRemount(m.Flags) && !mh.IsBind(m.Flags) &&
++		!mh.IsMove(m.Flags) && !mh.HasPropagationFlag(m.Flags) {
++		switch m.FsType {
++		case "sysfs":
++			return os.Getenv("SYSBOX_SYSFS_TRANSFER_HELPER") != ""
++		case "overlay", "nfs", "cifs", "smb3":
++			return false
++		default:
++			return true
++		}
++	}
++	if mh.IsMove(m.Flags) || mh.HasPropagationFlag(m.Flags) {
++		return false
++	}
++	if mh.IsRemount(m.Flags) {
++		// The fallback can tighten the read-only flag or change only atime.
++		return mh.IsReadOnlyMount(m.Flags) || fuseBindAtimeOperation(m.Flags) != ""
++	}
++	return mh.IsBind(m.Flags)
++}
++
++func fuseTargetProcFD(raw string, tgid []string, tid uint32) (int, bool) {
++	descriptor, ok := strings.CutPrefix(raw, "/proc/thread-self/fd/")
++	if !ok && len(tgid) == 1 && tgid[0] == strconv.FormatUint(uint64(tid), 10) {
++		descriptor, ok = strings.CutPrefix(raw, "/proc/self/fd/")
++	}
++	if !ok {
++		return 0, false
++	}
++	fd, err := strconv.ParseUint(descriptor, 10, 31)
++	return int(fd), err == nil && strconv.FormatUint(fd, 10) == descriptor
++}
++
++func readMountRequesterFile(taskFD int, name string) (string, error) {
++	fd, err := unix.Openat(taskFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
++	if err != nil {
++		return "", err
++	}
++	file := os.NewFile(uintptr(fd), name)
++	defer file.Close()
++	data, err := io.ReadAll(file)
++	return string(data), err
++}
++
++func mapFuseRequesterIDs(ids []string, mappings string) ([]string, error) {
++	if len(ids) != 4 {
++		return nil, syscall.EINVAL
++	}
++	mapped := make([]string, 0, len(ids))
++	for _, value := range ids {
++		id, err := strconv.ParseUint(value, 10, 32)
++		if err != nil {
++			return nil, err
++		}
++		var found bool
++		for _, line := range strings.Split(strings.TrimSpace(mappings), "\n") {
++			var local, parent, length uint64
++			if _, err := fmt.Sscan(line, &local, &parent, &length); err != nil {
++				return nil, err
++			}
++			if id >= parent && id-parent < length {
++				mapped = append(mapped, strconv.FormatUint(local+id-parent, 10))
++				found = true
++				break
++			}
++		}
++		if !found {
++			return nil, syscall.EOVERFLOW
++		}
++	}
++	return mapped, nil
++}
++
++func readFuseMountTarget(socket int) (*fuseMountTarget, uint64, error) {
++	data := make([]byte, unix.PathMax+8)
++	control := make([]byte, unix.CmsgSpace(4))
++	n, cn, flags, _, err := unix.Recvmsg(socket, data, control, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
++	if err != nil {
++		return nil, 0, err
++	}
++	msgs, err := unix.ParseSocketControlMessage(control[:cn])
++	if err != nil || len(msgs) != 1 {
++		return nil, 0, syscall.EIO
++	}
++	fds, err := unix.ParseUnixRights(&msgs[0])
++	if err != nil || len(fds) != 1 {
++		for _, fd := range fds {
++			unix.Close(fd)
++		}
++		return nil, 0, syscall.EIO
++	}
++	target := os.NewFile(uintptr(fds[0]), "pinned FUSE target")
++	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || n <= 8 {
++		target.Close()
++		return nil, 0, syscall.EIO
++	}
++	path := string(data[8:n])
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		target.Close()
++		return nil, 0, syscall.EXDEV
++	}
++	return &fuseMountTarget{file: target, path: path}, binary.NativeEndian.Uint64(data[:8]), nil
++}
+diff --git a/sysbox-fs/seccomp/mount.go b/sysbox-fs/seccomp/mount.go
+index 021c8c1..1c85780 100644
+--- a/sysbox-fs/seccomp/mount.go
++++ b/sysbox-fs/seccomp/mount.go
+@@ -33,6 +33,7 @@ type mountSyscallInfo struct {
+ 	syscallCtx                        // syscall generic info
+ 	*domain.MountSyscallPayload       // mount-syscall specific details
+ 	notifyFd                    int32 // original seccomp listener; never passed to the helper
++	fuseTarget                  *fuseMountTarget
+ }
+ 
+ // Mount syscall processing wrapper instruction.
+@@ -104,8 +105,22 @@ func (m *mountSyscallInfo) process() (*sysResponse, error) {
+ 			return resp, nil
+ 		}
+ 
+-		if mip.IsSysboxfsBaseMount(m.Target) ||
+-			mip.IsSysboxfsSubmount(m.Target) {
++		managedBase := mip.IsSysboxfsBaseMount(m.Target)
++		managedSubmount := mip.IsSysboxfsSubmount(m.Target)
++		if operation := fuseBindAtimeOperation(m.Flags); m.fuseTarget != nil && operation != "" {
++			info := mip.GetInfo(m.Target)
++			if !managedBase && !managedSubmount && info != nil && !mip.IsRoMount(info) {
++				return m.setFuseMountAttribute(operation)
++			}
++			return m.tracer.createErrorResponse(m.reqId, syscall.ENOENT), nil
++		}
++		if managedBase || managedSubmount {
++			if m.fuseTarget != nil {
++				if managedSubmount {
++					return m.setFuseMountAttribute("readonly")
++				}
++				return m.tracer.createErrorResponse(m.reqId, syscall.ENOENT), nil
++			}
+ 			return m.processRemount(mip)
+ 		}
+ 
+@@ -141,6 +156,15 @@ func (m *mountSyscallInfo) process() (*sysResponse, error) {
+ 		// Process bind-mounts whose source is a sysbox-fs base mount (as we
+ 		// want the submounts to also be bind-mounted at the target).
+ 		if m.Source != m.Target && mip.IsSysboxfsBaseMount(m.Source) {
++			if m.fuseTarget != nil {
++				// The native recursive bind already carries all protected
++				// submounts, as does the ordinary recursive bind payload.
++				if m.Flags&unix.MS_REC != 0 {
++					return m.tracer.createContinueResponse(m.reqId), nil
++				}
++				// The nonrecursive emulation reopens its destination.
++				return m.tracer.createErrorResponse(m.reqId, syscall.ENOENT), nil
++			}
+ 			return m.processBindMount(mip)
+ 		}
+ 
+diff --git a/sysbox-fs/seccomp/proc_transfer.go b/sysbox-fs/seccomp/proc_transfer.go
+index 0cb1a83..7806bda 100644
+--- a/sysbox-fs/seccomp/proc_transfer.go
++++ b/sysbox-fs/seccomp/proc_transfer.go
+@@ -41,7 +41,7 @@ func (m *mountSyscallInfo) processNestedProcMount() (*sysResponse, bool, error)
+ 	if err != nil {
+ 		return nil, true, err
+ 	}
+-	if outer == user {
++	if outer == user && m.fuseTarget == nil {
+ 		return nil, false, nil
+ 	}
+ 	reject := func(e syscall.Errno) (*sysResponse, bool, error) {
+@@ -104,7 +104,13 @@ func (m *mountSyscallInfo) processNestedProcMount() (*sysResponse, bool, error)
+ 			return nil, true, err
+ 		}
+ 	}
+-	if err := addRooted(targetRoot, m.Target, unix.O_PATH|unix.O_DIRECTORY); err != nil {
++	if m.fuseTarget != nil {
++		fd, err := unix.FcntlInt(m.fuseTarget.file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
++		if err != nil {
++			return nil, true, err
++		}
++		files = append(files, os.NewFile(uintptr(fd), "pinned FUSE target"))
++	} else if err := addRooted(targetRoot, m.Target, unix.O_PATH|unix.O_DIRECTORY); err != nil {
+ 		return nil, true, err
+ 	}
+ 	if err := addRooted(outerRoot, "/", unix.O_PATH|unix.O_DIRECTORY); err != nil {
+@@ -148,6 +154,9 @@ func (m *mountSyscallInfo) processNestedProcMount() (*sysResponse, bool, error)
+ 	}
+ 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+ 	defer cancel()
++	if m.fuseTarget != nil {
++		args = append([]string{"--pinned-fuse-target"}, args...)
++	}
+ 	cmd := exec.CommandContext(ctx, helper, args...)
+ 	cmd.ExtraFiles = files
+ 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+diff --git a/sysbox-fs/seccomp/sysfs_transfer.go b/sysbox-fs/seccomp/sysfs_transfer.go
+index fb83c9a..7f186e5 100644
+--- a/sysbox-fs/seccomp/sysfs_transfer.go
++++ b/sysbox-fs/seccomp/sysfs_transfer.go
+@@ -30,7 +30,7 @@ func (m *mountSyscallInfo) processNestedSysMount() (*sysResponse, bool, error) {
+ 	if err != nil {
+ 		return reject(err)
+ 	}
+-	if outer == user {
++	if outer == user && m.fuseTarget == nil {
+ 		return nil, false, nil
+ 	}
+ 	if err = sysfstransfer.Validate(m.Flags, m.Data); err != nil {
+@@ -39,7 +39,11 @@ func (m *mountSyscallInfo) processNestedSysMount() (*sysResponse, bool, error) {
+ 	if m.root != "/" || !m.processInfo.IsSysAdminCapabilitySet() || m.cntr.IsImmutableMountpoint(m.Target) || m.cntr.IsImmutableOverlapMountpoint(m.Target) {
+ 		return reject(syscall.EPERM)
+ 	}
+-	r, err := sysfstransfer.Acquire(m.cntr, m.pid, m.uid, m.gid, m.Target, m.Flags, "", nil)
++	var pinned *os.File
++	if m.fuseTarget != nil {
++		pinned = m.fuseTarget.file
++	}
++	r, err := sysfstransfer.AcquireMount(m.cntr, m.pid, m.uid, m.gid, m.Target, m.Flags, pinned)
+ 	if err != nil {
+ 		return reject(err)
+ 	}
+diff --git a/sysbox-fs/seccomp/tracer.go b/sysbox-fs/seccomp/tracer.go
+index 17a946f..0a377d9 100644
+--- a/sysbox-fs/seccomp/tracer.go
++++ b/sysbox-fs/seccomp/tracer.go
+@@ -654,9 +654,32 @@ func (t *syscallTracer) processMount(
+ 
+ 	// Verify the process has the proper rights to access the target and
+ 	// update it in case it requires path resolution.
+-	mount.Target, err = process.PathAccess(mount.Target, 0, true)
++	resolvedTarget := mount.Target
++	mount.Target, err = process.PathAccess(resolvedTarget, 0, true)
+ 	if err != nil {
+-		return t.createErrorResponse(req.ID, err), nil
++		// A host-side lookup can report ENOENT or EACCES on a user-owned FUSE
++		// filesystem. For pure propagation changes the existing mount
++		// policy delegates to the kernel, which can look up the original
++		// target with the requester's mount namespace and credentials.
++		if retryMountPropagationInKernel(mount.Flags, err) {
++			return t.createContinueResponse(req.ID), nil
++		}
++		if err != syscall.ENOENT && err != syscall.EACCES {
++			return t.createErrorResponse(req.ID, err), nil
++		}
++		pinned, lookupErr := mount.resolveFuseMountTarget(resolvedTarget, target)
++		if lookupErr != nil {
++			if errno, ok := lookupErr.(syscall.Errno); ok {
++				return t.createErrorResponse(req.ID, errno), nil
++			}
++			return nil, lookupErr
++		}
++		if pinned == nil {
++			return t.createErrorResponse(req.ID, err), nil
++		}
++		defer pinned.file.Close()
++		mount.fuseTarget = pinned
++		mount.Target = pinned.path
+ 	}
+ 
+ 	// Collect process attributes required for mount execution.
+@@ -678,6 +701,20 @@ func (t *syscallTracer) processMount(
+ 	return mount.process()
+ }
+ 
++// Propagation changes do not create, replace or remount a filesystem.
++func retryMountPropagationInKernel(flags uint64, lookupErr error) bool {
++	if lookupErr != syscall.ENOENT && lookupErr != syscall.EACCES {
++		return false
++	}
++
++	switch flags &^ unix.MS_REC {
++	case unix.MS_SHARED, unix.MS_PRIVATE, unix.MS_SLAVE, unix.MS_UNBINDABLE:
++		return true
++	default:
++		return false
++	}
++}
++
+ func (t *syscallTracer) processUmount(
+ 	req *sysRequest,
+ 	fd int32,
+@@ -729,6 +766,12 @@ func (t *syscallTracer) processUmount(
+ 	// update it in case it requires path resolution.
+ 	umount.Target, err = process.PathAccess(umount.Target, 0, true)
+ 	if err != nil {
++		if err == syscall.EACCES {
++			umount.Target = target
++			if response, handled, err := umount.detachFusePreviousRoot(fd); handled {
++				return response, err
++			}
++		}
+ 		if err == syscall.ENOENT {
+ 			// XXX: in some cases PathAccess() will unexpectedly hit an ENOENT when
+ 			// walking the path. We've seen this occur on user-created FUSE mounts
+diff --git a/sysbox-fs/sysfstransfer/transfer.go b/sysbox-fs/sysfstransfer/transfer.go
+index 3f67a0b..36d7d70 100644
+--- a/sysbox-fs/sysfstransfer/transfer.go
++++ b/sysbox-fs/sysfstransfer/transfer.go
+@@ -131,7 +131,15 @@ func taskAlive(thread int) error {
+ 	}
+ }
+ 
+-func Acquire(c domain.ContainerIface, tid, uid, gid uint32, target string, flags uint64, operation string, channel *os.File) (_ *Request, err error) {
++func Acquire(c domain.ContainerIface, tid, uid, gid uint32, target string, flags uint64, operation string, channel *os.File) (*Request, error) {
++	return acquire(c, tid, uid, gid, target, flags, operation, channel, nil)
++}
++
++func AcquireMount(c domain.ContainerIface, tid, uid, gid uint32, target string, flags uint64, pinnedTarget *os.File) (*Request, error) {
++	return acquire(c, tid, uid, gid, target, flags, "", nil, pinnedTarget)
++}
++
++func acquire(c domain.ContainerIface, tid, uid, gid uint32, target string, flags uint64, operation string, channel, pinnedTarget *os.File) (_ *Request, err error) {
+ 	if c == nil || !c.IsRegistrationCompleted() || uid < c.UID() || uid-c.UID() >= c.UidSize() || gid < c.GID() || gid-c.GID() >= c.GidSize() {
+ 		return nil, syscall.EPERM
+ 	}
+@@ -213,6 +221,13 @@ func Acquire(c domain.ContainerIface, tid, uid, gid uint32, target string, flags
+ 			return nil, syscall.EINVAL
+ 		}
+ 		r.Args = append(r.Args, "--"+operation+"="+strings.TrimPrefix(target, "/sys/"))
++	} else if pinnedTarget != nil {
++		fd, e := unix.FcntlInt(pinnedTarget.Fd(), unix.F_DUPFD_CLOEXEC, 0)
++		if e != nil {
++			return nil, e
++		}
++		r.Files = append(r.Files, os.NewFile(uintptr(fd), "pinned FUSE target"))
++		r.Args = append([]string{"--pinned-fuse-target"}, r.Args...)
+ 	} else {
+ 		root, e := unix.Openat(requester, "root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+ 		if e != nil {

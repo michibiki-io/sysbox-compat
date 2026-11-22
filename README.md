@@ -39,6 +39,8 @@ The default is a native build. `dist/` receives `sysbox-fs`, `proc-mount-helper`
 
 Pinned inputs and recorded hashes do not establish byte-identical rebuilds. Builder apt repositories and upstream Go module availability remain external dependencies. A successful build on another architecture is compilation evidence only, not runtime validation. This repository publishes source, not binaries.
 
+For nested rootful Docker on `fuse-overlayfs`, configure both paired helpers, `SYSBOX_PROC_TRANSFER_HELPER` and `SYSBOX_SYSFS_TRANSFER_HELPER`, on a [supported kernel](docs/compatibility.md). The lookup worker opens targets with the notifying thread’s filesystem credentials in its User and Mount namespaces and keeps the descriptor through protected mounts. Supply `/dev/fuse` to the outer container and keep the kernel’s default FUSE access setting.
+
 ### Verify
 
 Focused local checks require Python 3, Bash and a C compiler with Linux headers:
@@ -125,6 +127,8 @@ manifest は ELF のアーキテクチャ、コンポーネントのリビジョ
 未設定の場合は従来の proc mount 処理を使用します。
 コンテナの呼び出し元が実行ファイルや環境変数を書き換えられないように管理します。
 ホストの導入設定は本リポジトリの対象外です。
+
+[対応カーネル](docs/compatibility.md)で入れ子の rootful Docker に `fuse-overlayfs` を使う場合は、同じビルドの `SYSBOX_PROC_TRANSFER_HELPER` と `SYSBOX_SYSFS_TRANSFER_HELPER` を設定します。通知元スレッドの User・Mount 名前空間とファイルシステム資格情報で対象を開き、保護付きマウントまで FD を保持します。外側コンテナに `/dev/fuse` を渡し、カーネルの FUSE アクセス設定は既定値を使用します。
 
 固定値の正本は [build/sources.lock.json](build/sources.lock.json) です。
 ビルドスクリプトは固定値を Docker のビルド引数に渡し、ソースの整合性をハッシュで確認します。

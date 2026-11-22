@@ -7,7 +7,47 @@
 
 - [New sysfs and network checks](#new-sysfs-and-network-checks) / [新規 sysfs と Network の検査](#新規-sysfs-と-network-の検査)
 
+- [FUSE mount regressions](#fuse-mount-regressions) / [FUSE マウントの回帰検査](#fuse-マウントの回帰検査)
+
 ## English
+
+### FUSE mount regressions
+
+Run the probe inside a disposable Sysbox container with `/dev/fuse`,
+`fuse-overlayfs`, a C compiler, and util-linux `unshare`. Configure the
+daemon with the paired `proc-mount-helper` and keep the host-wide
+`fuse.allow_sys_admin_access` option disabled. The default OCI proc masks and
+the read-only `/proc/sysrq-trigger` must be present.
+
+```sh
+cc -O2 -Wall -Wextra -Werror tests/runtime/fuse-overlay-mount.c -o /tmp/fuse-mount-probe
+sh tests/runtime/fuse-overlay-mounts.sh /tmp/fuse-mount-probe
+```
+
+The probe uses a private mount namespace and checks propagation, bind mounts,
+ordinary error handling, and procfs setup from both the outer and direct-child
+User namespaces. The protected child mount uses a procfd destination. The
+probe compares the registered mask and read-only mount identities and checks
+that the child cannot detach the read-only mount.
+
+Run the end-to-end Docker probe in separate disposable outer containers, one
+with the inner Docker daemon configured for each driver. Supply the probe
+script and its sibling SPDX verifier. The `overlay2` case also requires Python
+and starts a BuildKit worker with the `fuse-overlayfs` snapshotter.
+
+```sh
+sh tests/runtime/fuse-docker-build.sh fuse-overlayfs
+sh tests/runtime/fuse-docker-build.sh overlay2
+```
+
+BuildKit v0.35.1 forwards full-root FUSE snapshots to runc as
+`fuse3.fuse-overlayfs`. Its kernel mount attempt returns `ENODEV`. For the
+SPDX probe, build an isolated worker from v0.35.1 with
+[`buildkit-fuse-bind.patch`](buildkit-fuse-bind.patch) applied, place its
+`buildkitd` in the matching worker image, and set `FUSE_TEST_BUILDKIT` to that
+image. The patch uses BuildKit's existing submount path to mount the FUSE
+snapshot and pass a bind mount to runc. The normal Docker build and Buildx
+bootstrap probes use their ordinary images.
 
 ### Actual Sysbox path
 
@@ -143,6 +183,42 @@ These fixtures inject independent snapshots/readers and exercise real getdents p
 Downstream **MUST** pin the immutable full commit containing this change and its source inventory, including the shared module and regressions. A commit cannot embed its own future SHA: on the final clean checkout resolve `git rev-parse HEAD`, pin that resulting full SHA, verify `build/sources.lock.json` with `scripts/build.py`'s `load_lock()` and run the strict `test_contracts.py` inventory check. Fetch all public files at that same SHA in their relative layout. For paired builds retain the generated `manifest.json` input/output hashes and that checkout SHA. A branch name, historical binary release or diagnostic source edit does not identify these tests.
 
 ## 日本語
+
+### FUSE マウントの回帰検査
+
+ホストの `fuse.allow_sys_admin_access` を無効にしたまま、同じビルドの
+`proc-mount-helper` を使います。使い捨て Sysbox コンテナに `/dev/fuse` を渡し、
+`fuse-overlayfs`、C コンパイラー、util-linux の `unshare` を用意してください。
+既定の OCI proc マスクと読み取り専用の `/proc/sysrq-trigger` を使用します。
+
+```sh
+cc -O2 -Wall -Wextra -Werror tests/runtime/fuse-overlay-mount.c -o /tmp/fuse-mount-probe
+sh tests/runtime/fuse-overlay-mounts.sh /tmp/fuse-mount-probe
+```
+
+専用の Mount 名前空間でマウント伝播、bind mount、エラー応答を確認します。外側と
+直接の子 User 名前空間から procfs をマウントし、子では procfd を使います。
+マスクと読み取り専用マウントの同一性を比較し、子から読み取り専用マウントを
+解除できないことも確認します。
+
+Docker の統合試験は、外側の使い捨てコンテナをドライバーごとに用意して実行します。
+スクリプトと同じディレクトリに SPDX 検査スクリプトを置きます。
+`overlay2` の試験は Python を使い、BuildKit のスナップショッターとして
+`fuse-overlayfs` を起動します。
+
+```sh
+sh tests/runtime/fuse-docker-build.sh fuse-overlayfs
+sh tests/runtime/fuse-docker-build.sh overlay2
+```
+
+BuildKit v0.35.1 では、FUSE スナップショット全体を選択すると
+`fuse3.fuse-overlayfs` が runc に渡り、カーネルが `ENODEV` を返します。
+SPDX の試験には v0.35.1 に
+[`buildkit-fuse-bind.patch`](buildkit-fuse-bind.patch) を適用した検証用ワーカーを
+使います。同じバージョンのワーカーイメージに `buildkitd` を入れ、そのイメージを
+`FUSE_TEST_BUILDKIT` に指定します。BuildKit の既存処理で FUSE スナップショットを
+マウントし、runc には bind mount を渡します。通常の Docker ビルドと Buildx 起動の
+試験には既定のイメージを使います。
 
 ### 実際の Sysbox 経路
 

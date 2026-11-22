@@ -1,0 +1,13 @@
+diff --git a/executor/oci/spec.go b/executor/oci/spec.go
+index 6cabae5..8620b2b 100644
+--- a/executor/oci/spec.go
++++ b/executor/oci/spec.go
+@@ -284,7 +284,7 @@ type submounts struct {
+ 
+ func (s *submounts) subMount(m mount.Mount, subPath string) (mount.Mount, error) {
+ 	// for Windows, always go through the sub-mounting process
+-	if path.Join("/", subPath) == "/" && runtime.GOOS != "windows" {
++	if path.Join("/", subPath) == "/" && runtime.GOOS != "windows" && !strings.HasPrefix(m.Type, "fuse3.") {
+ 		return m, nil
+ 	}
+ 	if s.m == nil {
