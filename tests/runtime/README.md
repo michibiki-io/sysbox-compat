@@ -15,7 +15,7 @@
 
 Run the probe inside a disposable Sysbox container with `/dev/fuse`,
 `fuse-overlayfs`, a C compiler, and util-linux `unshare`. Configure the
-daemon with the paired `proc-mount-helper` and keep the host-wide
+daemon with the paired `proc-mount-helper` and `sysfs-mount-helper` and keep the host-wide
 `fuse.allow_sys_admin_access` option disabled. The default OCI proc masks and
 the read-only `/proc/sysrq-trigger` must be present.
 
@@ -27,8 +27,10 @@ sh tests/runtime/fuse-overlay-mounts.sh /tmp/fuse-mount-probe
 The probe uses a private mount namespace and checks propagation, bind mounts,
 ordinary error handling, and procfs setup from both the outer and direct-child
 User namespaces. The protected child mount uses a procfd destination. The
-probe compares the registered mask and read-only mount identities and checks
-that the child cannot detach the read-only mount.
+probe compares the registered mask and read-only mount identities, rejects
+a non-directory procfd destination, and checks that the child cannot detach
+the read-only mount. It also mounts protected sysfs from both User
+namespaces with procfd targets and checks the child's detach protection.
 
 Run the end-to-end Docker probe in separate disposable outer containers, one
 with the inner Docker daemon configured for each driver. Supply the probe
@@ -37,7 +39,7 @@ and starts a BuildKit worker with the `fuse-overlayfs` snapshotter.
 
 ```sh
 sh tests/runtime/fuse-docker-build.sh fuse-overlayfs
-sh tests/runtime/fuse-docker-build.sh overlay2
+FUSE_TEST_BUILDKIT=sysbox-buildkit-fuse-fixture:v0.35.1 sh tests/runtime/fuse-docker-build.sh overlay2
 ```
 
 BuildKit v0.35.1 forwards full-root FUSE snapshots to runc as
@@ -48,6 +50,38 @@ SPDX probe, build an isolated worker from v0.35.1 with
 image. The patch uses BuildKit's existing submount path to mount the FUSE
 snapshot and pass a bind mount to runc. The normal Docker build and Buildx
 bootstrap probes use their ordinary images.
+
+#### Build the SPDX test worker
+
+Run these commands from the repository root on each test architecture or on a
+native builder for it. They require Git, Docker and registry access. The source
+and base image are pinned independently. Load the resulting fixture image into
+the inner Docker daemon before running the `overlay2` test.
+
+```sh
+worker=$(mktemp -d)
+revision=412cc86ad3c4252b82e929f9b1b1ad167376ded8
+git -C "$worker" init
+git -C "$worker" fetch --depth=1 https://github.com/moby/buildkit.git "$revision"
+git -C "$worker" checkout --detach FETCH_HEAD
+git -C "$worker" apply "$PWD/tests/runtime/buildkit-fuse-bind.patch"
+docker run --rm -e "BUILD_KIT_REVISION=$revision" -v "$worker:/src" -w /src \
+  golang:1.27.2-trixie@sha256:47667934874913a449b96faa7ef4777fa285d9ec29126ee80ed61c45b7cccf0e \
+  sh -ec '
+    apt-get update
+    apt-get install --no-install-recommends -y libseccomp-dev pkg-config
+    CGO_ENABLED=1 go build -buildvcs=false -mod=vendor -trimpath \
+      -tags "osusergo netgo static_build seccomp grpcnotrace" \
+      -ldflags "-extldflags -static -X github.com/moby/buildkit/version.Version=v0.35.1+sysbox-fixture -X github.com/moby/buildkit/version.Revision=$BUILD_KIT_REVISION" \
+      -o /src/buildkitd ./cmd/buildkitd
+  '
+printf '%s\n' \
+  'FROM moby/buildkit:buildx-stable-1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c' \
+  'COPY buildkitd /usr/bin/buildkitd' >"$worker/Fixture.Dockerfile"
+docker build --label "org.opencontainers.image.revision=$revision" \
+  -f "$worker/Fixture.Dockerfile" -t sysbox-buildkit-fuse-fixture:v0.35.1 "$worker"
+docker run --rm --entrypoint /usr/bin/buildkitd sysbox-buildkit-fuse-fixture:v0.35.1 --version
+```
 
 ### Actual Sysbox path
 
@@ -187,7 +221,7 @@ Downstream **MUST** pin the immutable full commit containing this change and its
 ### FUSE マウントの回帰検査
 
 ホストの `fuse.allow_sys_admin_access` を無効にしたまま、同じビルドの
-`proc-mount-helper` を使います。使い捨て Sysbox コンテナに `/dev/fuse` を渡し、
+`proc-mount-helper` と `sysfs-mount-helper` を使います。使い捨て Sysbox コンテナに `/dev/fuse` を渡し、
 `fuse-overlayfs`、C コンパイラー、util-linux の `unshare` を用意してください。
 既定の OCI proc マスクと読み取り専用の `/proc/sysrq-trigger` を使用します。
 
@@ -198,8 +232,10 @@ sh tests/runtime/fuse-overlay-mounts.sh /tmp/fuse-mount-probe
 
 専用の Mount 名前空間でマウント伝播、bind mount、エラー応答を確認します。外側と
 直接の子 User 名前空間から procfs をマウントし、子では procfd を使います。
-マスクと読み取り専用マウントの同一性を比較し、子から読み取り専用マウントを
-解除できないことも確認します。
+マスクと読み取り専用マウントの同一性を比較し、ディレクトリ以外の procfd を
+拒否することと、子から読み取り専用マウントを解除できないことを確認します。
+sysfs も両方の User 名前空間から procfd を使ってマウントし、子からの解除が
+拒否されることを確認します。
 
 Docker の統合試験は、外側の使い捨てコンテナをドライバーごとに用意して実行します。
 スクリプトと同じディレクトリに SPDX 検査スクリプトを置きます。
@@ -208,7 +244,7 @@ Docker の統合試験は、外側の使い捨てコンテナをドライバー�
 
 ```sh
 sh tests/runtime/fuse-docker-build.sh fuse-overlayfs
-sh tests/runtime/fuse-docker-build.sh overlay2
+FUSE_TEST_BUILDKIT=sysbox-buildkit-fuse-fixture:v0.35.1 sh tests/runtime/fuse-docker-build.sh overlay2
 ```
 
 BuildKit v0.35.1 では、FUSE スナップショット全体を選択すると
@@ -218,7 +254,8 @@ SPDX の試験には v0.35.1 に
 使います。同じバージョンのワーカーイメージに `buildkitd` を入れ、そのイメージを
 `FUSE_TEST_BUILDKIT` に指定します。BuildKit の既存処理で FUSE スナップショットを
 マウントし、runc には bind mount を渡します。通常の Docker ビルドと Buildx 起動の
-試験には既定のイメージを使います。
+試験には既定のイメージを使います。ワーカーのソースとベースイメージの固定には
+[ビルド手順](#build-the-spdx-test-worker)を使います。
 
 ### 実際の Sysbox 経路
 

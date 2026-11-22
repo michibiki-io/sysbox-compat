@@ -49,11 +49,20 @@ The same-User route keeps the registered protection mounts and their attributes.
 The direct-child route also locks the protections before attachment.
 
 The existing dispatch still decides which operations need emulation. The
-fallback changes a single permitted mount attribute on a pinned descriptor.
+fallback changes permitted attributes on one pinned mount and retains existing
+security restrictions. Unsupported flag combinations fail. The target path
+travels over the private worker socket.
 Old-root detachment requires the immutable-unmount option, a separate Mount
 namespace and a non-shared old root stacked on the new FUSE root. The worker
 uses the pinned old root. It leaves the normal procfs and sysfs unmount policy
-in place.
+in place. Managed base mount remounts and nonrecursive binds, new overlay,
+NFS and CIFS mounts, and other unmounts are outside this fallback.
+
+The daemon returns a timeout after 15 seconds without holding the reaper guard
+or waiting for worker exit. It sends SIGKILL on timeout. A worker waiting on an
+unresponsive FUSE server in the kernel may survive until the request finishes.
+Each live or unreaped worker retains a slot. The limits are eight per container
+and 64 per daemon. At capacity the fallback returns `EAGAIN`.
 
 `pipe-max-size` is a global kernel value. Its read path uses the trusted
 procfs directly to keep FUSE reads out of the requester's mount namespace.
@@ -152,10 +161,18 @@ procfd はスレッドから複製し、想定したパスと照合します。�
 取り付け前に保護マウントをロックします。
 
 エミュレーションの要否は既存の振り分けで判定します。代替経路でマウント属性を変更する
-場合は、許可された属性だけを保持済みの FD に適用します。旧ルートを解除できるのは、
+場合は、許可された属性を固定済みの一つのマウントに適用し、既存の保護を維持します。
+対応外のフラグの組み合わせは失敗します。対象パスは専用ソケットで渡します。旧ルートを解除できるのは、
 immutable unmount を許可しており、専用の Mount 名前空間で新しい FUSE ルートの上に
 非共有の旧ルートが重なる場合です。解除にはその FD を使います。procfs と sysfs の通常の
-解除判定は引き続き適用します。
+解除判定は引き続き適用します。管理下のベースマウントの remount と非再帰 bind、
+新規 overlay・NFS・CIFS マウント、それ以外の unmount にはこの代替経路を使いません。
+
+デーモンは検査プロセスの終了を待たず、reaper guard を解放した状態で15秒後に
+タイムアウトを返し、SIGKILL を送ります。カーネル内で応答しない FUSE を待つ
+プロセスは、要求が完了するまで残る場合があります。実行中または回収前の
+プロセスは枠を占有します。上限はコンテナごとに8、デーモン全体で64で、
+上限に達すると代替経路は `EAGAIN` を返します。
 
 `pipe-max-size` はカーネル全体の値です。読み取りには信頼済みの procfs を使い、
 要求元の Mount 名前空間に入り直す処理を避けます。書き込みは拒否します。

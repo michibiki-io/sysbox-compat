@@ -7,6 +7,8 @@
 
 - [Sysfs consumer gate](#sysfs-consumer-gate) / [sysfs の consumer gate](#sysfs-の-consumer-gate)
 
+- [FUSE overlay mounts](#fuse-overlay-mounts) / [FUSE overlay マウント](#fuse-overlay-マウント)
+
 ## English
 
 ### Validated baseline
@@ -81,6 +83,22 @@ Issues #9 and #11 correct environment-dependent runtime assertions without chang
 The unchanged official downstream v0.4.1 suite passed original proc/bwrap/protection checks and eight fresh-sysfs cases, then FAILED at interleave. Later write-policy, stress, helper rejection/lifecycle and supporting cases were UNRUN. The separate minimal diagnostic found correct current-Network FUSE views alongside differing inherited native views; it is inherited diagnostic evidence, not an official suite pass or a rerun of this checkout. Write-policy and dentry scope corrections come from source inspection, not claimed runtime failures. Unprivileged injected fixtures and parser/command-construction checks provide local regression evidence only. Actual Sysbox/helper runtime cases remain UNRUN without their configured disposable fixture; registered outer protection and separate failure-helper cases additionally require those fixtures. This is a fixture prerequisite limitation, not a kernel/hardware excuse or a new platform-support claim. The independent sysfs consumer gate remains unchanged.
 
 Downstream MUST pin the full immutable commit of this change plus its complete source inventory. Resolve the final clean checkout with `git rev-parse HEAD`, then pin that returned SHA with `build/sources.lock.json`; do not insert a future self-referential SHA into the commit. Verify source hashes and strict public inventory at that SHA, retain relative runtime/shared-module layout and build `manifest.json` input/output hashes, and record PASS/FAIL/UNRUN for that exact revision. No private evidence or operational logs are build inputs.
+
+### FUSE overlay mounts
+
+The initial Issue #13 candidate passed inner rootful Docker 27.5.1 with
+`fuse-overlayfs` on AMD64/Linux 6.18.64 and ARM64/Linux 7.1.0, both with Sysbox
+0.7.1 and `fuse.allow_sys_admin_access=N`. Base pull, Dockerfile build, image
+start and Buildx bootstrap passed. FUSE-backed protected procfs transfer
+requires procfs `pidns` configuration support even in the outer User namespace.
+See the [regression instructions](../tests/runtime/README.md#fuse-mount-regressions).
+
+Stock BuildKit v0.35.1 failed the FUSE snapshotter SBOM case on both
+architectures. An AMD64 control using ordinary runc outside Sysbox also failed
+with `ENODEV`. The test-only patched worker generated and verified the
+digest-linked SPDX attestation in Sysbox on both architectures. For the stock
+BuildKit controls, see [Issue #13](https://github.com/michibiki-io/sysbox-proc-transfer/issues/13#issuecomment-7087716327).
+Real Talos and the release-sized storage performance comparison remain unrun.
 
 ## 日本語
 
@@ -283,3 +301,20 @@ commit 内に将来の自身の SHA を記録しません。
 同じ SHA の source hash と厳格な公開 inventory を確認し、runtime と共有 module の相対配置、build の `manifest.json` の入出力 hash を保持します。
 対象 revision の PASS／FAIL／UNRUN を区別して記録します。
 非公開の証跡や運用生ログを build 入力に含めません。
+
+### FUSE overlay マウント
+
+Issue #13 の初回候補では、AMD64／Linux 6.18.64 と ARM64／Linux 7.1.0 で、
+内側の rootful Docker 27.5.1 による `fuse-overlayfs` の動作を確認しました。
+両環境とも Sysbox 0.7.1 で `fuse.allow_sys_admin_access=N` です。
+ベースイメージの pull、Dockerfile のビルド、イメージの起動、Buildx の起動が
+通りました。FUSE 配下の保護付き procfs 転送では、外側の User 名前空間でも
+procfs の `pidns` 指定に対応するカーネルが必要です。
+[回帰検査の手順](../tests/runtime/README.md#fuse-マウントの回帰検査)を参照してください。
+
+標準 BuildKit v0.35.1 は両アーキテクチャで FUSE スナップショッターを使った
+SBOM 生成に失敗しました。Sysbox を外して標準の runc で実行した AMD64 の対照試験
+でも `ENODEV` でした。検証用パッチを適用したワーカーでは、Sysbox 内で両方の
+アーキテクチャでイメージのダイジェストに紐づいた SPDX を生成・検証できました。
+[対照試験は Issue #13](https://github.com/michibiki-io/sysbox-proc-transfer/issues/13#issuecomment-7087716327)
+に記録しています。実際の Talos とリリース規模のストレージ性能比較は未検証です。

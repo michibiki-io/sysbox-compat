@@ -5,6 +5,12 @@
 set -eu
 
 test -c /dev/fuse
+parameter=/sys/module/fuse/parameters/allow_sys_admin_access
+if test -r "$parameter"; then
+    value=$(cat "$parameter")
+    printf 'fuse.allow_sys_admin_access=%s\n' "$value"
+    test "$value" = N
+fi
 probe=${1:?path to mount probe required}
 test -x "$probe"
 fixture=$(mktemp -d)
@@ -19,10 +25,12 @@ trap 'exit 143' TERM
 
 mkdir -p "$fixture/lower/bind" "$fixture/lower/proc" "$fixture/lower/child-proc" \
     "$fixture/upper" "$fixture/work" "$fixture/merged" "$fixture/source" \
-    "$fixture/lower/denied/target" "$fixture/ordinary"
+    "$fixture/lower/denied/target" "$fixture/ordinary" \
+    "$fixture/lower/outer-sys" "$fixture/lower/child-sys"
 chmod 755 "$fixture"
 chmod 000 "$fixture/lower/denied"
 printf 'fuse-overlay fixture\n' >"$fixture/lower/origin"
+touch "$fixture/lower/not-directory"
 printf 'bind fixture\n' >"$fixture/source/marker"
 
 unshare --mount --propagation private sh -s "$fixture" "$probe" <<'MOUNTS'
@@ -32,7 +40,7 @@ probe=$2
 fuse-overlayfs -o "lowerdir=$fixture/lower,upperdir=$fixture/upper,workdir=$fixture/work" "$fixture/merged"
 test "$(cat "$fixture/merged/origin")" = 'fuse-overlay fixture'
 
-# Run all three independent checks even if another check fails.
+# Run independent checks even if another check fails.
 failed=0
 if "$probe" private "$fixture/merged"; then
     printf 'PASS propagation\n'
@@ -60,12 +68,14 @@ else
 fi
 
 # The requester owns the new PID namespace but stays in the outer User
-# namespace. A proc mount must give it the namespace-local PID view.
+# namespace. Check the namespace-local PID view and the registered mask.
+mask=$(stat -c '%d:%i' /proc/keys)
 if unshare --mount --pid --fork sh -eu -c '
     test "$$" -eq 1
     "$1" proc "$2"
     test "$(readlink "$2/1/ns/pid")" = "$(readlink /proc/self/ns/pid)"
-' sh "$probe" "$fixture/merged/proc"; then
+    test "$(stat -c "%d:%i" "$2/keys")" = "$3"
+' sh "$probe" "$fixture/merged/proc" "$mask"; then
     printf 'PASS outer-user proc\n'
 else
     printf 'FAIL outer-user proc\n' >&2
@@ -74,11 +84,11 @@ fi
 
 # The child uses a procfd target and must receive locked copies of the
 # registered proc protections. Capture the reference identities outside it.
-mask=$(stat -c '%d:%i' /proc/keys)
 readonly=$(stat -c '%d:%i' /proc/sysrq-trigger)
 if unshare --user --map-root-user --mount --pid --fork sh -eu -c '
     test "$$" -eq 1
     "$1" proc-fd "$2"
+    "$1" proc-bad-fd "${2%/*}/not-directory"
     test "$(readlink "$2/1/ns/pid")" = "$(readlink /proc/self/ns/pid)"
     test "$(stat -c "%d:%i" "$2/keys")" = "$3"
     test "$(stat -c "%d:%i" "$2/sysrq-trigger")" = "$4"
@@ -93,6 +103,29 @@ else
     printf 'FAIL direct-child-user procfd or mount protections\n' >&2
     failed=1
 fi
+
+# Use an independently owned Network namespace for each fresh sysfs mount.
+# Verify the registered mask's identity on both protected transfer paths.
+sysmask=$(stat -c '%d:%i' /sys/firmware)
+for scope in outer child; do
+    set -- --mount --net
+    if test "$scope" = child; then
+        set -- --user --map-root-user "$@"
+    fi
+    if unshare "$@" sh -eu -c '
+        "$1" sys-fd "$2"
+        test "$(stat -c "%d:%i" "$2/firmware")" = "$3"
+        test "$(stat -f -c "%t" "$2")" = 62656572
+        if test "$4" = child && umount -l "$2/firmware"; then
+            exit 1
+        fi
+    ' sh "$probe" "$fixture/merged/$scope-sys" "$sysmask" "$scope"; then
+        printf 'PASS %s-user sysfs protected procfd mount\n' "$scope"
+    else
+        printf 'FAIL %s-user sysfs protected procfd mount\n' "$scope" >&2
+        failed=1
+    fi
+done
 
 # Detach children before allowing fuse-overlayfs to exit.
 umount "$fixture/merged/bind" 2>/dev/null || true

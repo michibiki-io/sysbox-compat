@@ -17,7 +17,7 @@ PUBLIC_FILES = {
     "tests/runtime/buildkit-fuse-bind.patch",
     "tests/runtime/fuse-docker-build.sh", "tests/runtime/fuse-verify-spdx.py",
     "tests/upstream/fuse_mount_target_test.go",
-    "helper/fuse-mount-lookup.h",
+    "helper/fuse-mount-lookup.h", "tests/unit/fuse-mount-lookup.c",
     "patches/fuse-overlay-mount.patch", "tests/upstream/mount_propagation_test.go",
     "tests/runtime/fuse-overlay-mount.c", "tests/runtime/fuse-overlay-mounts.sh",
     "tests/runtime/sysfs_oracle.py", "tests/static/test_sysfs_oracle.py",
@@ -150,6 +150,10 @@ class Contracts(unittest.TestCase):
                                  ("tests/runtime/verify.c", "verify")):
                 subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror",
                                 str(ROOT / source), "-o", str(Path(work) / name)], check=True)
+            fixture = Path(work) / "fuse-lookup"
+            subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
+                            str(ROOT / "tests/unit/fuse-mount-lookup.c"), "-o", str(fixture)], check=True)
+            subprocess.run([str(fixture)], check=True, timeout=5)
             # No inherited contract FDs: direct invocation is unauthorized, even under root.
             result = subprocess.run([str(Path(work) / "helper"), "0", "0", "0"],
                                     close_fds=True, capture_output=True, timeout=5)

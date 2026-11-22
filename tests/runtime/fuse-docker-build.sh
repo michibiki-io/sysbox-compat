@@ -5,7 +5,8 @@ set -eu
 
 driver=${1:?expected Docker driver required}
 case "$driver" in
-    fuse-overlayfs|overlay2) ;;
+    fuse-overlayfs) ;;
+    overlay2) : "${FUSE_TEST_BUILDKIT:?patched BuildKit fixture image required for the SBOM test}" ;;
     *) printf 'Expected fuse-overlayfs or overlay2\n' >&2; exit 2 ;;
 esac
 test "$(docker info --format '{{.Driver}}')" = "$driver"
@@ -40,9 +41,12 @@ if test "$driver" = fuse-overlayfs; then
     docker buildx inspect --bootstrap "$label"
     printf 'PASS Docker build, image run, and Buildx bootstrap\n'
 else
+    revision=$(docker image inspect "$FUSE_TEST_BUILDKIT" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+    test "$revision" = 412cc86ad3c4252b82e929f9b1b1ad167376ded8
+    printf 'BuildKit fixture source=%s\n' "$revision"
     mkdir "$fixture/worker"
     printf 'FROM %s\nRUN apk add --no-cache fuse-overlayfs\n' \
-        "${FUSE_TEST_BUILDKIT:-moby/buildkit:buildx-stable-1}" >"$fixture/worker/Dockerfile"
+        "$FUSE_TEST_BUILDKIT" >"$fixture/worker/Dockerfile"
     DOCKER_BUILDKIT=1 docker build --progress=plain -t "$buildkit" "$fixture/worker"
     # Preload the fixture image before Buildx starts the docker-container worker.
     printf '[worker.oci]\n  snapshotter = "fuse-overlayfs"\n' >"$fixture/buildkitd.toml"
