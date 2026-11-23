@@ -85,10 +85,10 @@ index 7781d7b..b964dd3 100644
  
 diff --git a/sysbox-fs/seccomp/perf_output.go b/sysbox-fs/seccomp/perf_output.go
 new file mode 100644
-index 0000000..3b7ece2
+index 0000000..65effc4
 --- /dev/null
 +++ b/sysbox-fs/seccomp/perf_output.go
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,207 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package seccomp
@@ -262,15 +262,21 @@ index 0000000..3b7ece2
 +	if errno != 0 {
 +		return t.createErrorResponse(req.ID, errno)
 +	}
-+	defer unix.Close(int(fd))
-+	if perfCallerScope(req.Pid, cntrID) != scope {
-+		return native
++	return t.replyWithPerfOutput(req.ID, listener, int(fd), perfCallerScope(req.Pid, cntrID) == scope)
++}
++
++// replyWithPerfOutput owns fd until the reply is complete. If the second
++// authorization check failed, only the caller's native syscall may proceed.
++func (t *syscallTracer) replyWithPerfOutput(id uint64, listener int32, fd int, authorized bool) *sysResponse {
++	defer unix.Close(fd)
++	if !authorized {
++		return t.createContinueResponse(id)
 +	}
-+	reply := perfOutputAddFD{ID: req.ID, Flags: notifAddFDSend, SrcFD: uint32(fd), NewFDFlags: unix.O_CLOEXEC}
-+	_, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(listener), ioctlNotifAddFD, uintptr(unsafe.Pointer(&reply)))
++	reply := perfOutputAddFD{ID: id, Flags: notifAddFDSend, SrcFD: uint32(fd), NewFDFlags: unix.O_CLOEXEC}
++	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(listener), ioctlNotifAddFD, uintptr(unsafe.Pointer(&reply)))
 +	runtime.KeepAlive(&reply)
 +	if errno != 0 {
-+		return t.createErrorResponse(req.ID, errno)
++		return t.createErrorResponse(id, errno)
 +	}
 +	return nil // ADDFD_FLAG_SEND has already answered the notification.
 +}
@@ -468,10 +474,10 @@ index 0000000..8ca0362
 +}
 diff --git a/sysbox-fs/seccomp/perf_output_test.go b/sysbox-fs/seccomp/perf_output_test.go
 new file mode 100644
-index 0000000..ff736a8
+index 0000000..767f7e7
 --- /dev/null
 +++ b/sysbox-fs/seccomp/perf_output_test.go
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,129 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package seccomp
@@ -581,6 +587,24 @@ index 0000000..ff736a8
 +		if got := tracer.processCiliumJITProbeInfo(req, -1, ""); !reflect.DeepEqual(got, want) {
 +			t.Fatalf("BPF ABI %v did not continue: %v", arch, got)
 +		}
++	}
++}
++
++func TestPerfOutputContinuesAfterRegistrationRemoval(t *testing.T) {
++	fd, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	tracer := &syscallTracer{}
++	const id = 42
++	// An invalid listener makes any attempt to transfer the FD fail.
++	got := tracer.replyWithPerfOutput(id, -1, fd, false)
++	if !reflect.DeepEqual(got, tracer.createContinueResponse(id)) {
++		t.Errorf("expected native continuation, got %+v", got)
++	}
++	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != unix.EBADF {
++		t.Fatalf("expected the unreleased FD to be closed, got %v", err)
 +	}
 +}
 diff --git a/sysbox-fs/seccomp/cilium_jit_info_test.go b/sysbox-fs/seccomp/cilium_jit_info_test.go
