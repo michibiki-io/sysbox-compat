@@ -17,6 +17,11 @@ The test fixture `tests/runtime/buildkit-fuse-bind.patch` modifies the Apache-2.
 [BuildKit v0.35.1 source](https://github.com/moby/buildkit/tree/v0.35.1).
 It serves the isolated SBOM probe.
 
+The experimental `patches/cilium-v1.20.4-warning-lab.patch` modifies
+[Cilium v1.20.4](https://github.com/cilium/cilium/tree/beb276d2f38d4aadfda14710acf8d14a0f1ba723).
+Affected source files retain their Apache-2.0 headers and copyright attributed
+to the Authors of Cilium. The patch records the modifications. [Upstream license](https://github.com/cilium/cilium/blob/beb276d2f38d4aadfda14710acf8d14a0f1ba723/LICENSE)
+
 ## 日本語
 
 `patches/proc-transfer.patch`、`patches/sysfs-transfer.patch`、`patches/fuse-overlay-mount.patch` は Sysbox v0.7.1 の `sysbox-fs` と、そこにリンクする `sysbox-runc` namespace-entry source を変更する Apache-2.0 の派生物です。
@@ -39,3 +44,8 @@ root の MIT は binary license inventory でも、これらの義務の代替�
 
 SBOM 検証用の `tests/runtime/buildkit-fuse-bind.patch` は、Apache-2.0 の
 [BuildKit v0.35.1 ソース](https://github.com/moby/buildkit/tree/v0.35.1) に対するパッチです。
+
+試験用の `patches/cilium-v1.20.4-warning-lab.patch` は
+[Cilium v1.20.4](https://github.com/cilium/cilium/tree/beb276d2f38d4aadfda14710acf8d14a0f1ba723)
+を変更します。パッチ適用後も対象ファイルの Apache-2.0 と Authors of Cilium の
+著作権表示を保持します。 [上流のライセンス](https://github.com/cilium/cilium/blob/beb276d2f38d4aadfda14710acf8d14a0f1ba723/LICENSE)

@@ -78,6 +78,58 @@ passed all five catalog network cases. The same run logged these two warnings.
 | TCX ingress `BPF_PROG_QUERY` failed in the endpoint BPF watchdog | On a query error the watchdog returns before it can decide whether to reload the missing programs. [Endpoint watchdog](https://github.com/cilium/cilium/blob/v1.20.4/pkg/endpoint/watchdog/ep-bpfprog-watchdog.go) | Normal datapath, DNS, and BGP tests passed. Recovery after detaching an endpoint program was not exercised. |
 | `BPF_PROG_TYPE_TRACING` failed when starting the socket termination job | Failure to create the destroyer prevents the loop from monitoring deleted or unhealthy backends and terminating their existing TCP and UDP sockets. [Socket termination job](https://github.com/cilium/cilium/blob/v1.20.4/pkg/loadbalancer/reconciler/termination.go) | Endpoint deletion and BGP withdrawal passed. Forced termination of an established socket to a removed backend was not exercised. |
 
+### Separate Cilium patch for the warnings
+
+[The warning patch](../patches/cilium-v1.20.4-warning-lab.patch) applies to
+[Cilium v1.20.4 at the recorded commit](https://github.com/cilium/cilium/tree/beb276d2f38d4aadfda14710acf8d14a0f1ba723).
+Its input is a clean Cilium checkout. Run the following from this repository with
+`cilium_source` set to the checkout's absolute path. Apply the patch only to a
+disposable checkout.
+
+```sh
+test "$(git -C "$cilium_source" rev-parse HEAD)" = beb276d2f38d4aadfda14710acf8d14a0f1ba723
+git -C "$cilium_source" apply --check "$PWD/patches/cilium-v1.20.4-warning-lab.patch"
+git -C "$cilium_source" apply "$PWD/patches/cilium-v1.20.4-warning-lab.patch"
+mkdir -p dist/cilium-warning
+docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
+  -v "$cilium_source:/src:ro" -v "$PWD/dist/cilium-warning:/out" -w /src \
+  -e CGO_ENABLED=0 -e GOMAXPROCS=4 \
+  docker.io/library/golang@sha256:2005724102f45917a63e9d092fc0e4ea56ea575048ce147caad5f5f61502c365 \
+  go build -p 4 -mod=vendor -buildvcs=false \
+  -ldflags '-s -w -X "github.com/cilium/cilium/pkg/version.ciliumVersion=1.20.4 beb276d2f38d4aadfda14710acf8d14a0f1ba723 2026-10-23"' \
+  -o /out/cilium-agent ./daemon
+sha256sum patches/cilium-v1.20.4-warning-lab.patch dist/cilium-warning/cilium-agent
+```
+
+In the disposable two-node catalog environment, place the trial binary on both
+kind nodes, mount it read-only in the Agent container, and use it as that
+container's command with the original args. Make the same experiment-only
+DaemonSet override in the bootstrap, VTEP, and GitOps exports so that each
+catalog test uses the same Agent. The Sysbox setup above supplies the same
+BPF token and perf/JIT authorization.
+
+- For TCX, select a disposable veth endpoint on each node. Read the ID and
+  ifindex of its Cilium-owned ingress link under the endpoint's bpffs link
+  directory. Remove only that test endpoint's pin. Wait for the watchdog to
+  install a different link ID on the same ifindex, then check connectivity.
+- For socket termination, create two test Services with connected UDP clients
+  and separate healthy backends. Change one Service's selector to remove
+  its original backend while keeping that Pod alive. Verify that its original
+  connected socket is aborted and the other Service's connected client still
+  receives responses. Require the Agent to log selection of the existing
+  Netlink implementation after BPF initialization was denied.
+
+On amd64, Linux 6.18.44 and Sysbox 0.7.1, the two checks and the five original
+catalog network tests completed in 251.78 seconds. The TCX check exercised veth
+endpoints. Socket termination through the Service reconciler was observed
+for UDP. The standard Sysbox release recipe does not consume this patch.
+
+| Trial evidence | SHA-256 |
+| --- | --- |
+| Cilium source patch | `1c43664e15410af216dfe0fefa8b2a34f3fd9373c6854d9f218b30e8e590e746` |
+| Built Cilium Agent exercised on both nodes | `cef56243d3a0579816f1334cb0b428647a82a1e2e92dc5ead82ee796ff69fd5d` |
+| Local test log | `a574a6b66ea4d47248401405abaea7f51dcba038121afa78d07267291b8c4add` |
+
 ## 日本語
 
 ### ビルドと個別テスト
@@ -115,3 +167,21 @@ Linux 6.18.44 の amd64 環境で Cilium 1.20.4 の両 Agent が Ready になり
 削除・異常バックエンドへの既存ソケットを強制終了するジョブが起動しませんでした。
 手動でデタッチしたプログラムの自動修復と、削除したバックエンドへの
 既存ソケットの強制終了は未検証です。
+
+### 警告に対応する Cilium 側の試験パッチ
+
+上記の手順で、固定した Cilium v1.20.4 に試験パッチを適用して Agent を
+ビルドできます。使い捨て kind の両ノードに Agent を配置し、bootstrap、
+VTEP、GitOps の各出力で同じ Agent を参照しました。
+
+- TCX は、Cilium 自身がピン留めしたリンクを使ってアタッチ状態を照合します。
+  テスト用 veth endpoint のピンを外し、watchdog が同じ ifindex に別の
+  リンクを作って通信が戻ることを両ノードで確認しました。
+- ソケット終了処理は、Netlink の機能プローブが成功し、BPF の初期化で
+  権限エラーになった場合に、既存の Netlink 実装に切り替えます。
+  Service のバックエンドを外すと、元の Pod は稼働したまま既存 UDP
+  ソケットが終了し、対照の通信が続くことを確認しました。
+
+amd64、Linux 6.18.44、Sysbox 0.7.1 の使い捨て環境で、上記 2 件と
+既存のカタログネットワークテスト 5 件が通りました。実行時間は 251.78 秒です。
+TCX の実機検証は veth、Service 経由のソケット終了の実機検証は UDP が対象です。
