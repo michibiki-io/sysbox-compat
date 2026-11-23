@@ -247,6 +247,35 @@ func TestFuseWorkerSlots(t *testing.T) {
 	if err != unix.ENOENT {
 		t.Fatalf("queue failed to recheck notification liveness: %v", err)
 	}
+	if limit.pending != 0 || len(limit.waiting) != 0 {
+		t.Fatalf("inactive waiters retain queue space: %d, %v", limit.pending, limit.waiting)
+	}
+
+	limit.pending = fuseQueuePerContainer
+	limit.waiting["first"] = fuseQueuePerContainer
+	if err := limit.acquire("first", time.Now().Add(time.Second), valid); err != unix.EAGAIN {
+		t.Fatalf("full container queue = %v, want EAGAIN", err)
+	}
+	limit.pending = fuseQueueTotal
+	limit.active = fuseWorkersTotal
+	if err := limit.acquire("new", time.Now().Add(time.Second), valid); err != unix.EAGAIN {
+		t.Fatalf("full global queue = %v, want EAGAIN", err)
+	}
+}
+
+func TestFuseLegacyMountFlags(t *testing.T) {
+	const legacyMagic = 0xc0ed0000
+	const bind = unix.MS_BIND | unix.MS_REMOUNT | unix.MS_NOATIME
+	if got := fuseBindAtimeOperation(normalizeMountFlags(legacyMagic | bind)); got != "noatime" {
+		t.Fatalf("legacy bind remount classified as %q", got)
+	}
+	if retryMountPropagationInKernel(normalizeMountFlags(legacyMagic|unix.MS_REC), unix.ENOENT) {
+		t.Fatal("legacy magic bits were interpreted as propagation flags")
+	}
+	const modern = unix.MS_BIND | unix.MS_NOSYMFOLLOW | unix.MS_LAZYTIME
+	if got := normalizeMountFlags(modern); got != modern {
+		t.Fatalf("modern flags changed: %#x", got)
+	}
 }
 
 type fuseWorkerTestWriter struct {

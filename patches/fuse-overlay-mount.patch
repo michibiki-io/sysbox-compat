@@ -67,10 +67,10 @@ index 4f5739e..71baddd 100644
  
 diff --git a/sysbox-fs/seccomp/fuse_target.go b/sysbox-fs/seccomp/fuse_target.go
 new file mode 100644
-index 0000000..b1dd39c
+index 0000000..21f9374
 --- /dev/null
 +++ b/sysbox-fs/seccomp/fuse_target.go
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,661 @@
 +package seccomp
 +
 +import (
@@ -142,9 +142,31 @@ index 0000000..b1dd39c
 +	if helper == "" {
 +		return nil, nil
 +	}
-+	if err := libseccomp.NotifIDValid(libseccomp.ScmpFd(notifyFD), m.reqId); err != nil {
++	valid := func() error {
++		return libseccomp.NotifIDValid(libseccomp.ScmpFd(notifyFD), m.reqId)
++	}
++	if err := valid(); err != nil {
 +		return nil, err
 +	}
++
++	// Preflight without retaining any new descriptors or task state while
++	// queued. Credentials and mount topology are read after admission.
++	taskRoot := fmt.Sprintf("/proc/%d", m.pid)
++	hasOverlay, err := requesterHasFuseOverlay(taskRoot)
++	if err != nil || !hasOverlay {
++		return nil, err
++	}
++	key := m.cntr.ID()
++	deadline := time.Now().Add(15 * time.Second)
++	if err := fuseWorkers.acquire(key, deadline, valid); err != nil {
++		return nil, err
++	}
++	started := false
++	defer func() {
++		if !started {
++			fuseWorkers.release(key)
++		}
++	}()
 +
 +	pidfd, err := openProcRequesterPidfd(int(m.pid), unix.PidfdOpen)
 +	if err != nil {
@@ -156,24 +178,11 @@ index 0000000..b1dd39c
 +			file.Close()
 +		}
 +	}()
-+	taskRoot := fmt.Sprintf("/proc/%d", m.pid)
 +	taskFD, err := unix.Open(taskRoot, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 +	if err != nil {
 +		return nil, err
 +	}
 +	defer unix.Close(taskFD)
-+
-+	mountInfo, err := readMountRequesterFile(taskFD, "mountinfo")
-+	if err != nil {
-+		return nil, err
-+	}
-+	table, hasOverlay, err := parseFuseMountTable(mountInfo)
-+	if err != nil {
-+		return nil, err
-+	}
-+	if !hasOverlay {
-+		return nil, nil
-+	}
 +
 +	statusText, err := readMountRequesterFile(taskFD, "status")
 +	if err != nil {
@@ -224,8 +233,16 @@ index 0000000..b1dd39c
 +		files = append(files, os.NewFile(uintptr(fd), "requester "+path))
 +	}
 +	if operation == "detach" {
-+		valid, err := m.verifyPreviousRoot(taskFD, files[1], files[2], table)
-+		if err != nil || !valid {
++		mountInfo, err := readMountRequesterFile(taskFD, "mountinfo")
++		if err != nil {
++			return nil, err
++		}
++		table, _, err := parseFuseMountTable(mountInfo)
++		if err != nil {
++			return nil, err
++		}
++		eligible, err := m.verifyPreviousRoot(taskFD, files[1], files[2], table)
++		if err != nil || !eligible {
 +			return nil, err
 +		}
 +		args[1] = "detach"
@@ -253,20 +270,11 @@ index 0000000..b1dd39c
 +		files = append(files, os.NewFile(uintptr(duplicate), "pinned FUSE target"))
 +	}
 +
-+	key := m.cntr.ID()
-+	deadline := time.Now().Add(15 * time.Second)
-+	valid := func() error {
-+		return libseccomp.NotifIDValid(libseccomp.ScmpFd(notifyFD), m.reqId)
-+	}
-+	if err := fuseWorkers.acquire(key, deadline, valid); err != nil {
-+		return nil, err
-+	}
 +	cmd := exec.Command(helper, args...)
 +	cmd.ExtraFiles = files
 +	cmd.Env = []string{}
 +	guard, ok := m.tracer.service.nss.(interface{ WithChildReaperGuard(func() error) error })
 +	if !ok {
-+		fuseWorkers.release(key)
 +		return nil, syscall.ENOTSUP
 +	}
 +	err = guard.WithChildReaperGuard(func() error {
@@ -279,9 +287,9 @@ index 0000000..b1dd39c
 +		return cmd.Start()
 +	})
 +	if err != nil {
-+		fuseWorkers.release(key)
 +		return nil, err
 +	}
++	started = true
 +
 +	_ = files[3].Close()
 +	target, id, err := awaitFuseWorker(cmd, pair[0], path, deadline, func() {
@@ -301,12 +309,12 @@ index 0000000..b1dd39c
 +	if target.file == nil {
 +		return nil, syscall.EIO
 +	}
-+	mountInfo, err = readMountRequesterFile(taskFD, "mountinfo")
++	mountInfo, err := readMountRequesterFile(taskFD, "mountinfo")
 +	if err != nil {
 +		target.file.Close()
 +		return nil, err
 +	}
-+	table, _, err = parseFuseMountTable(mountInfo)
++	table, _, err := parseFuseMountTable(mountInfo)
 +	if err != nil {
 +		target.file.Close()
 +		return nil, err
@@ -502,6 +510,20 @@ index 0000000..b1dd39c
 +	return int(fd), err == nil && strconv.FormatUint(fd, 10) == descriptor
 +}
 +
++func requesterHasFuseOverlay(taskPath string) (bool, error) {
++	taskFD, err := unix.Open(taskPath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return false, err
++	}
++	defer unix.Close(taskFD)
++	info, err := readMountRequesterFile(taskFD, "mountinfo")
++	if err != nil {
++		return false, err
++	}
++	_, found, err := parseFuseMountTable(info)
++	return found, err
++}
++
 +func readMountRequesterFile(taskFD int, name string) (string, error) {
 +	fd, err := unix.Openat(taskFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 +	if err != nil {
@@ -545,12 +567,16 @@ index 0000000..b1dd39c
 +const (
 +	fuseWorkersPerContainer = 8
 +	fuseWorkersTotal        = 64
++	fuseQueuePerContainer   = 32
++	fuseQueueTotal          = 256
 +)
 +
 +type fuseWorkerLimit struct {
 +	sync.Mutex
 +	active      int
 +	byContainer map[string]int
++	pending     int
++	waiting     map[string]int
 +	changed     chan struct{}
 +}
 +
@@ -559,7 +585,17 @@ index 0000000..b1dd39c
 +func (l *fuseWorkerLimit) acquire(id string, deadline time.Time, valid func() error) error {
 +	var check *time.Ticker
 +	var expiry *time.Timer
++	queued := false
 +	defer func() {
++		if queued {
++			l.Lock()
++			l.pending--
++			l.waiting[id]--
++			if l.waiting[id] == 0 {
++				delete(l.waiting, id)
++			}
++			l.Unlock()
++		}
 +		if check != nil {
 +			check.Stop()
 +			expiry.Stop()
@@ -579,6 +615,18 @@ index 0000000..b1dd39c
 +			l.byContainer[id]++
 +			l.Unlock()
 +			return nil
++		}
++		if !queued {
++			if l.pending >= fuseQueueTotal || l.waiting[id] >= fuseQueuePerContainer {
++				l.Unlock()
++				return syscall.EAGAIN
++			}
++			if l.waiting == nil {
++				l.waiting = make(map[string]int)
++			}
++			l.waiting[id]++
++			l.pending++
++			queued = true
 +		}
 +		if l.changed == nil {
 +			l.changed = make(chan struct{})
@@ -802,7 +850,7 @@ index fb83c9a..7f186e5 100644
  		return reject(err)
  	}
 diff --git a/sysbox-fs/seccomp/tracer.go b/sysbox-fs/seccomp/tracer.go
-index 17a946f..b193da0 100644
+index 17a946f..feecbdf 100644
 --- a/sysbox-fs/seccomp/tracer.go
 +++ b/sysbox-fs/seccomp/tracer.go
 @@ -26,6 +26,7 @@ import (
@@ -813,7 +861,33 @@ index 17a946f..b193da0 100644
  	unixIpc "github.com/nestybox/sysbox-ipc/unix"
  	"github.com/nestybox/sysbox-libs/formatter"
  	linuxUtils "github.com/nestybox/sysbox-libs/linuxUtils"
-@@ -654,9 +655,29 @@ func (t *syscallTracer) processMount(
+@@ -586,6 +587,16 @@ func (t *syscallTracer) processSyscall(
+ 	return resp, nil
+ }
+ 
++// Linux strips the historical mount magic before interpreting the flags.
++func normalizeMountFlags(flags uint64) uint64 {
++	const legacyMask = 0xffff0000
++	const legacyValue = 0xc0ed0000
++	if flags&legacyMask == legacyValue {
++		return flags &^ legacyMask
++	}
++	return flags
++}
++
+ func (t *syscallTracer) processMount(
+ 	req *sysRequest,
+ 	fd int32,
+@@ -630,7 +641,7 @@ func (t *syscallTracer) processMount(
+ 				Target: target,
+ 				FsType: fstype,
+ 				Data:   data,
+-				Flags:  req.Data.Args[3],
++				Flags:  normalizeMountFlags(req.Data.Args[3]),
+ 			},
+ 		},
+ 	}
+@@ -654,9 +665,29 @@ func (t *syscallTracer) processMount(
  
  	// Verify the process has the proper rights to access the target and
  	// update it in case it requires path resolution.
@@ -845,7 +919,7 @@ index 17a946f..b193da0 100644
  	}
  
  	// Collect process attributes required for mount execution.
-@@ -678,6 +699,20 @@ func (t *syscallTracer) processMount(
+@@ -678,6 +709,20 @@ func (t *syscallTracer) processMount(
  	return mount.process()
  }
  
@@ -866,7 +940,7 @@ index 17a946f..b193da0 100644
  func (t *syscallTracer) processUmount(
  	req *sysRequest,
  	fd int32,
-@@ -729,6 +764,12 @@ func (t *syscallTracer) processUmount(
+@@ -729,6 +774,12 @@ func (t *syscallTracer) processUmount(
  	// update it in case it requires path resolution.
  	umount.Target, err = process.PathAccess(umount.Target, 0, true)
  	if err != nil {

@@ -134,7 +134,10 @@ fi
 # Verify the registered mask's identity on both protected transfer paths.
 sysmask=$(stat -c '%d:%i' /sys/firmware)
 sysmask_ro=$(awk '$5 == "/sys/firmware" { print ($6 ~ /(^|,)ro(,|$)/) }' /proc/self/mountinfo)
-test "$sysmask_ro" = 0 || test "$sysmask_ro" = 1
+case "$sysmask_ro" in
+    0|1) ;;
+    *) printf 'FAIL expected one registered /sys/firmware mount in fixture\n' >&2; exit 1 ;;
+esac
 for scope in outer child; do
     set -- --mount --net
     if test "$scope" = child; then

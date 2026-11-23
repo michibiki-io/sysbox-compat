@@ -62,8 +62,13 @@ The daemon returns a timeout after 15 seconds without holding the reaper guard
 or waiting for worker exit. It sends SIGKILL on timeout. A worker waiting on an
 unresponsive FUSE server in the kernel may survive until the request finishes.
 Each live or unreaped worker retains a slot. The limits are eight per container
-and 64 per daemon. Queued requests wait within the same deadline and check
-notification validity before starting. The pinned upstream reaper uses
+and 64 per daemon. Up to 32 requests per container and 256 per daemon may wait
+for a slot within the same deadline. Extra requests receive `EAGAIN`. The daemon
+checks notification validity, then reads credentials and the old-root topology
+after admission. A pending request may retain its already authorized target
+descriptor. If the deadline expires, the daemon returns `ETIMEDOUT`. An action
+that already finished in the kernel may have taken effect before its reply
+was lost. The pinned upstream reaper uses
 `TryLock` and `Wait4(..., WNOHANG, ...)`.
 [Upstream reaper implementation](https://github.com/nestybox/sysbox-fs/blob/c3d2ebc65102e32e74e383675f03b45556326888/nsenter/reaper.go#L78-L90)
 
@@ -175,8 +180,11 @@ immutable unmount を許可しており、専用の Mount 名前空間で新し�
 タイムアウトを返し、SIGKILL を送ります。カーネル内で応答しない FUSE を待つ
 プロセスは、要求が完了するまで残る場合があります。実行中または回収前の
 プロセスは枠を占有します。上限はコンテナごとに8、デーモン全体で64です。
-枠が空くまで同じ期限内で待機し、起動前に通知の有効性を確認します。
-固定版 upstream の reaper は `TryLock` と `Wait4(..., WNOHANG, ...)` を使います。
+待機できるのはコンテナごとに32、デーモン全体で256までです。上限を超えた要求は
+`EAGAIN` になります。待機後、通知が有効であることを確かめてから資格情報と旧ルートの
+マウント構成を読み取ります。すでに認可した対象の FD は待機中も保持する場合があります。
+期限に達すると `ETIMEDOUT` を返します。カーネル内で操作が完了してから応答が
+失われた場合は、変更が反映されていることがあります。固定版 upstream の reaper は `TryLock` と `Wait4(..., WNOHANG, ...)` を使います。
 [upstream の reaper 実装](https://github.com/nestybox/sysbox-fs/blob/c3d2ebc65102e32e74e383675f03b45556326888/nsenter/reaper.go#L78-L90)
 
 `pipe-max-size` はカーネル全体の値です。読み取りには信頼済みの procfs を使い、

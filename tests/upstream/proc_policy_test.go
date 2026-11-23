@@ -3,6 +3,7 @@ package seccomp
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -190,7 +191,7 @@ func TestProcTransferRealNotification(t *testing.T) {
 	}
 	t.Setenv("SYSBOX_PROC_TRANSFER_HELPER", filepath.Join(work, "never-launch"))
 	fuseRequest := syscallCtx{pid: request.Pid, reqId: request.ID}
-	if target, err := fuseRequest.runFuseTargetWorker(int32(fd), "/", "", "proc", "lookup", nil); err == nil || target != nil {
+	if target, err := fuseRequest.runFuseTargetWorker(int32(fd), "/", "", "proc", "lookup", nil); !errors.Is(err, unix.ENOENT) || target != nil {
 		t.Fatalf("FUSE lookup accepted the invalid notification: %v, %v", target, err)
 	}
 	if err := libseccomp.NotifRespond(libseccomp.ScmpFd(fd), &libseccomp.ScmpNotifResp{ID: request.ID}); err == nil {
