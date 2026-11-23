@@ -34,7 +34,7 @@
     "helper/fuse-mount-lookup.h": "6f77ae66c662c511bddadbf487f5c4f652433f4f4f8f1522c8ae6fe7985ef930",
     "helper/proc-mount-helper.c": "aba64dfae89810f9ba08de7c94f1aae5745c26821446db81de7528f719d6e3fb",
     "helper/sysfs-mount-helper.c": "1c0319b8e9ab67418a70c579ba880772ae00cb15b0bda0d1b26fafdfe2e3760b",
-    "patches/cilium-bpf-lab.patch": "a70003f397cf35f1e8f58ee21e57b02a02292dff3a7c10d91fc9c1b4db8c43ce",
+    "patches/cilium-bpf-lab.patch": "ed15a7c006c6e89b5a70ee513ecb85c84d9d3b59d6412e8e3a21c027bab98e8a",
     "patches/cilium-v1.20.4-warning-lab.patch": "c9918be5c8a4d4afa256ae9838b0fa2c3878805cc5dcfe50d3dc1850c04cac74",
     "patches/fuse-overlay-mount.patch": "bd2f4c1a737af8610bba37131d8e9755121e5df9fc145b68fa6ab049958ea4b6",
     "patches/proc-transfer.patch": "d7a6b3962fe4d58eeed0537660f226d3542bccb71dc0c29c8069b5d61fe88838",

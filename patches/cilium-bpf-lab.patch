@@ -85,7 +85,7 @@ index 7781d7b..b964dd3 100644
  
 diff --git a/sysbox-fs/seccomp/perf_output.go b/sysbox-fs/seccomp/perf_output.go
 new file mode 100644
-index 0000000..6c4bab6
+index 0000000..3b7ece2
 --- /dev/null
 +++ b/sysbox-fs/seccomp/perf_output.go
 @@ -0,0 +1,201 @@
