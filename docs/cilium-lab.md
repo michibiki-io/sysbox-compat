@@ -61,8 +61,10 @@ The JIT unit tests check the request and response for the socket-filter and XDP
 probes and reject unsupported buffers, program types, and tags. The live JIT
 check uses one fixed, unattached socket-filter probe FD supplied by the disposable
 host and compares the result with the native kernel response when the experiment
-is disabled, unregistered, mismatched, or removed. The tag comparison was
-validated on Linux 6.18.44. A different kernel program tag uses the native path. XDP may ask for a translated
+is disabled, unregistered, mismatched, or removed. The live socket-filter tag comparison
+was validated on Linux 6.18.44. The focused XDP check covers the unit test.
+It does not capture an XDP probe reply from the live listener. A different
+kernel program tag uses the native path. XDP may ask for a translated
 instruction buffer, but the lab returns a scalar length and leaves that buffer
 untouched. Native BPF behavior applies outside the lab authorization.
 
@@ -98,8 +100,10 @@ probe のコンパイルを実行できます。固定ソースや既存パッ�
 
 JIT の個別テストでは socket filter と XDP の要求と応答を確認します。
 実機試験では固定の socket filter の FD で、無効時・未登録時・別ジョブ・
-登録削除後の応答を元のカーネル応答と比較します。タグ照合は Linux 6.18.44
-で確認しました。タグが一致しない場合はカーネル本来の応答になります。
+登録削除後の応答を元のカーネル応答と比較します。socket filter のタグ照合は
+Linux 6.18.44 の実機で確認しました。XDP の個別検証は単体テストで行い、
+実機のリスナーが返した XDP の応答は採取していません。タグが一致しない場合は
+カーネル本来の応答になります。
 XDP には変換後の命令列の長さを返し、命令バッファには書き込みません。
 
 ### Cilium の警告
