@@ -1,0 +1,548 @@
+--- a/sysbox-runc/libsysbox/syscont/syscalls.go
++++ b/sysbox-runc/libsysbox/syscont/syscalls.go
+@@ -21,6 +21,7 @@
+ 
+ import (
+ 	"fmt"
++	"os"
+ 
+ 	"github.com/opencontainers/runc/libcontainer/configs"
+ )
+@@ -401,6 +402,10 @@
+ 			list = append(list, s)
+ 		}
+ 
++		if os.Getenv("SYSBOX_EXPERIMENT_PERF_OUTPUT") == "1" {
++			list = append(list, &configs.Syscall{Name: "perf_event_open", Action: configs.Notify},
++				&configs.Syscall{Name: "bpf", Action: configs.Notify, Args: []*configs.Arg{{Index: 0, Op: configs.EqualTo, Value: 15}}})
++		}
+ 		config.SeccompNotif = &configs.Seccomp{
+ 			DefaultAction: configs.Allow,
+ 			Architectures: []string{"amd64", "x86", "arm64", "arm"},
+--- a/sysbox-fs/seccomp/tracer.go
++++ b/sysbox-fs/seccomp/tracer.go
+@@ -46,6 +46,8 @@
+ 
+ // Slice of supported syscalls to monitor.
+ var monitoredSyscalls = []string{
++	"perf_event_open",
++	"bpf",
+ 	"openat2",
+ 	"mount",
+ 	"umount2",
+@@ -476,7 +478,7 @@
+ 
+ 	// Process the incoming syscall and obtain response for seccomp-tracee.
+ 	resp, err := t.processSyscall(req, fd, cntrID)
+-	if err != nil {
++	if err != nil || resp == nil {
+ 		return
+ 	}
+ 
+@@ -509,6 +511,12 @@
+ 	syscallName := t.syscalls[seccompArchSyscallPair{archId, syscallId}]
+ 
+ 	switch syscallName {
++	case "bpf":
++		return t.processJITProbeInfoLab(req, fd, cntrID), nil
++
++	case "perf_event_open":
++		return t.processPerfOutputLab(req, fd, cntrID), nil
++
+ 	case "openat2":
+ 		resp, err = t.processOpenat2(req, fd, cntr)
+ 
+--- /dev/null
++++ b/sysbox-fs/seccomp/perf_output_lab.go
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package seccomp
++
++import (
++	"encoding/binary"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"syscall"
++	"unsafe"
++
++	libseccomp "github.com/seccomp/libseccomp-golang"
++	"golang.org/x/sys/unix"
++)
++
++// Experimental: the host administrator registers cgroups in its private run
++// directory. A request cannot select the cgroup FD, event type or event flags.
++const perfOutputPolicy = "/run/sysbox/perf-output-lab"
++const perfOutputType = 1
++const perfOutputConfig = 10
++const perfSampleRaw = 1 << 10
++const perfWatermark = 1 << 14
++const perfFDClOExec = 1 << 3
++const perfPIDCgroup = 1 << 2
++
++// Linux seccomp_notif_addfd is 24 bytes on both supported native architectures.
++const ioctlNotifAddFD = 0x40182103
++const notifAddFDSend = 1 << 1
++
++type perfOutputAddFD struct {
++	ID                              uint64
++	Flags, SrcFD, NewFD, NewFDFlags uint32
++}
++
++func readPerfOutputPolicy() ([]byte, error) {
++	fd, err := unix.Open(perfOutputPolicy, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
++	if err != nil {
++		return nil, err
++	}
++	file := os.NewFile(uintptr(fd), perfOutputPolicy)
++	defer file.Close()
++	var stat unix.Stat_t
++	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG ||
++		stat.Uid != 0 || stat.Mode&022 != 0 || stat.Size > 4096 {
++		return nil, unix.EPERM
++	}
++	return io.ReadAll(io.LimitReader(file, 4097))
++}
++
++func perfOutputScope(policy []byte, containerID string, caller string) string {
++	if len(policy) > 4096 || len(containerID) != 64 {
++		return ""
++	}
++	var best string
++	for _, line := range strings.Split(string(policy), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) != 2 || fields[0] != containerID {
++			continue
++		}
++		scope := fields[1]
++		if scope == "/" || !filepath.IsAbs(scope) || filepath.Clean(scope) != scope {
++			continue
++		}
++		if (caller == scope || strings.HasPrefix(caller, scope+"/")) && len(scope) > len(best) {
++			best = scope
++		}
++	}
++	return best
++}
++
++func perfOutputAttr(data []byte) bool {
++	if len(data) < 64 || len(data) > 136 {
++		return false
++	}
++	order := binary.NativeEndian
++	if order.Uint32(data[0:4]) != perfOutputType ||
++		order.Uint32(data[4:8]) != uint32(len(data)) ||
++		order.Uint64(data[8:16]) != perfOutputConfig ||
++		order.Uint64(data[24:32]) != perfSampleRaw {
++		return false
++	}
++	bits := order.Uint64(data[40:48])
++	wakeup := order.Uint32(data[48:52])
++	if (bits != 0 && bits != perfWatermark) || wakeup == 0 || wakeup >= 1<<24 {
++		return false
++	}
++	for _, region := range [][]byte{data[16:24], data[32:40], data[52:]} {
++		for _, b := range region {
++			if b != 0 {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func perfCallerScope(pid uint32, cntrID string) string {
++	policy, err := readPerfOutputPolicy()
++	if err != nil {
++		return ""
++	}
++	taskCgroups, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
++	if err != nil {
++		return ""
++	}
++	var caller string
++	for _, line := range strings.Split(string(taskCgroups), "\n") {
++		if strings.HasPrefix(line, "0::") {
++			caller = strings.TrimPrefix(line, "0::")
++			break
++		}
++	}
++	return perfOutputScope(policy, cntrID, caller)
++}
++
++func (t *syscallTracer) processPerfOutputLab(req *sysRequest, listener int32, cntrID string) *sysResponse {
++	deny := t.createErrorResponse(req.ID, syscall.EPERM)
++	arch := req.Data.Arch
++	if arch != libseccomp.ArchAMD64 && arch != libseccomp.ArchARM64 {
++		return deny
++	}
++	args := req.Data.Args
++	cpu := int32(args[2])
++	if int32(args[1]) != -1 || int32(args[3]) != -1 || args[4] != perfFDClOExec ||
++		cpu < 0 || cpu > 4095 || libseccomp.NotifIDValid(libseccomp.ScmpFd(listener), req.ID) != nil {
++		return deny
++	}
++
++	scope := perfCallerScope(req.Pid, cntrID)
++	if scope == "" {
++		return deny
++	}
++
++	// Read only the fixed header and a bounded native perf_event_attr. New
++	// features and layouts are denied until this lab explicitly supports them.
++	header, err := t.memParser.ReadSyscallBytesArgs(req.Pid, []memParserDataElem{{addr: args[0], size: 8}})
++	if err != nil || len(header) != 1 || len(header[0]) != 8 {
++		return deny
++	}
++	length := binary.NativeEndian.Uint32([]byte(header[0][4:8]))
++	if length < 64 || length > 136 {
++		return deny
++	}
++	input, err := t.memParser.ReadSyscallBytesArgs(req.Pid, []memParserDataElem{{addr: args[0], size: int(length)}})
++	if err != nil || len(input) != 1 || !perfOutputAttr([]byte(input[0])) {
++		return deny
++	}
++
++	root, err := unix.Open("/sys/fs/cgroup", unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return deny
++	}
++	defer unix.Close(root)
++	target, err := unix.Openat2(root, strings.TrimPrefix(scope, "/"), &unix.OpenHow{
++		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC,
++		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV,
++	})
++	if err != nil {
++		return deny
++	}
++	defer unix.Close(target)
++	if libseccomp.NotifIDValid(libseccomp.ScmpFd(listener), req.ID) != nil {
++		return deny
++	}
++
++	attr := []byte(input[0])
++	fd, _, errno := unix.Syscall6(unix.SYS_PERF_EVENT_OPEN, uintptr(unsafe.Pointer(&attr[0])),
++		uintptr(target), uintptr(cpu), ^uintptr(0), perfFDClOExec|perfPIDCgroup, 0)
++	runtime.KeepAlive(attr)
++	if errno != 0 {
++		return t.createErrorResponse(req.ID, errno)
++	}
++	defer unix.Close(int(fd))
++	if perfCallerScope(req.Pid, cntrID) != scope {
++		return deny
++	}
++	reply := perfOutputAddFD{ID: req.ID, Flags: notifAddFDSend, SrcFD: uint32(fd), NewFDFlags: unix.O_CLOEXEC}
++	_, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(listener), ioctlNotifAddFD, uintptr(unsafe.Pointer(&reply)))
++	runtime.KeepAlive(&reply)
++	if errno != 0 {
++		return t.createErrorResponse(req.ID, errno)
++	}
++	return nil // ADDFD_FLAG_SEND has already answered the notification.
++}
+--- /dev/null
++++ b/sysbox-fs/seccomp/jit_info_lab.go
+@@ -0,0 +1,170 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package seccomp
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"fmt"
++	"os"
++	"runtime"
++	"syscall"
++	"unsafe"
++
++	libseccomp "github.com/seccomp/libseccomp-golang"
++	"golang.org/x/sys/unix"
++)
++
++const objectInfoCommand = 15
++const socketFilterType = 1
++const xdpProgramType = 6
++
++// Cilium loads these two instructions to check JIT availability. Only the
++// scalar size of this exact probe can be supplied, never code or addresses.
++var ciliumJITProbeTag = sha256.Sum256([]byte{0xb7, 0, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0})
++
++// Cilium's dead-code probe uses only immediate values and local branches.
++var ciliumDeadCodeProbeTag = sha256.Sum256([]byte{
++	0xb7, 1, 0, 0, 0, 0, 0, 0,
++	0x15, 1, 2, 0, 1, 0, 0, 0,
++	0xb7, 0, 0, 0, 2, 0, 0, 0,
++	0x05, 0, 1, 0, 0, 0, 0, 0,
++	0xb7, 0, 0, 0, 3, 0, 0, 0,
++	0x95, 0, 0, 0, 0, 0, 0, 0,
++})
++
++func (t *syscallTracer) processJITProbeInfoLab(req *sysRequest, listener int32, cntrID string) *sysResponse {
++	continueInKernel := t.createContinueResponse(req.ID)
++	valid := func() bool {
++		return libseccomp.NotifIDValid(libseccomp.ScmpFd(listener), req.ID) == nil
++	}
++	arch, args := req.Data.Arch, req.Data.Args
++	if (arch != libseccomp.ArchAMD64 && arch != libseccomp.ArchARM64) ||
++		args[0] != objectInfoCommand || args[2] < 16 || args[2] > 256 ||
++		!valid() || perfCallerScope(req.Pid, cntrID) == "" {
++		return continueInKernel
++	}
++
++	fields, err := t.memParser.ReadSyscallBytesArgs(req.Pid, []memParserDataElem{{addr: args[1], size: int(args[2])}})
++	if err != nil || len(fields) != 1 || len(fields[0]) != int(args[2]) {
++		return continueInKernel
++	}
++	input := []byte(fields[0])
++	if !bytes.Equal(input[16:], make([]byte, len(input)-16)) {
++		return continueInKernel
++	}
++	order := binary.NativeEndian
++	callerFD := order.Uint32(input[0:4])
++	length := order.Uint32(input[4:8])
++	address := order.Uint64(input[8:16])
++	if callerFD > 1<<31-1 || length < 40 || length > 512 || address == 0 {
++		return continueInKernel
++	}
++	// Reject requests with user-provided buffers to receive raw instructions,
++	// JIT symbols, map IDs, or other pointer-based BPF metadata.
++	buffer, err := t.memParser.ReadSyscallBytesArgs(req.Pid, []memParserDataElem{{addr: address, size: int(length)}})
++	if err != nil || len(buffer) != 1 || len(buffer[0]) != int(length) {
++		return continueInKernel
++	}
++	translatedRequest, permitted := ciliumJITProbeRequest([]byte(buffer[0]))
++	if !permitted {
++		return continueInKernel
++	}
++	pidfd, err := openProcRequesterPidfd(int(req.Pid), unix.PidfdOpen)
++	if err != nil || !valid() {
++		if err == nil {
++			unix.Close(pidfd)
++		}
++		return continueInKernel
++	}
++	defer unix.Close(pidfd)
++	prog, err := unix.PidfdGetfd(pidfd, int(callerFD), 0)
++	if err != nil {
++		return continueInKernel
++	}
++	defer unix.Close(prog)
++	fdinfo, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", prog))
++	if err != nil || (!bytes.Contains(fdinfo, []byte("\nprog_type:\t1\n")) &&
++		!bytes.Contains(fdinfo, []byte("\nprog_type:\t6\n"))) {
++		return continueInKernel
++	}
++
++	// Query only the first 24 bytes to avoid passing any caller-controlled
++	// pointers into a privileged BPF syscall.
++	info := [24]byte{}
++	attr := struct {
++		FD, Length uint32
++		Pointer    uint64
++	}{uint32(prog), uint32(len(info)), uint64(uintptr(unsafe.Pointer(&info[0])))}
++	_, _, errno := unix.Syscall(unix.SYS_BPF, objectInfoCommand,
++		uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
++	runtime.KeepAlive(&info)
++	runtime.KeepAlive(&attr)
++	if errno != 0 || !valid() {
++		return continueInKernel
++	}
++	reply := ciliumJITProbeReply(info, int(length), translatedRequest)
++	if reply == nil {
++		return continueInKernel
++	}
++
++	// Pin the requester's address space before the final notification check.
++	// A later write must not reopen a numeric TID that may have been reused.
++	mem, err := unix.Open(fmt.Sprintf("/proc/%d/mem", req.Pid), unix.O_WRONLY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return continueInKernel
++	}
++	defer unix.Close(mem)
++	if perfCallerScope(req.Pid, cntrID) == "" || !valid() {
++		return continueInKernel
++	}
++	written, err := unix.Pwrite(mem, reply, int64(address))
++	if err != nil || written != len(reply) {
++		return t.createErrorResponse(req.ID, syscall.EFAULT)
++	}
++	return &sysResponse{ID: req.ID}
++}
++
++func ciliumJITProbeRequest(request []byte) (translated, permitted bool) {
++	if len(request) < 40 || len(request) > 512 {
++		return false, false
++	}
++	order := binary.NativeEndian
++	length := order.Uint32(request[20:24])
++	pointer := order.Uint64(request[32:40])
++	if (length == 0) != (pointer == 0) {
++		return false, false
++	}
++	for _, part := range [][]byte{request[:20], request[24:32], request[40:]} {
++		for _, value := range part {
++			if value != 0 {
++				return false, false
++			}
++		}
++	}
++	return length != 0, true
++}
++
++// Construct only the scalar response for a known program. The caller must
++// verify the notification and scope before writing this to tracee memory.
++func ciliumJITProbeReply(info [24]byte, length int, translatedRequest bool) []byte {
++	if length < 40 || length > 512 {
++		return nil
++	}
++	order := binary.NativeEndian
++	kind := order.Uint32(info[0:4])
++	reply := make([]byte, length)
++	switch {
++	case kind == socketFilterType && bytes.Equal(info[8:16], ciliumJITProbeTag[:8]) &&
++		order.Uint32(info[16:20]) != 0 && !translatedRequest:
++		copy(reply, info[:20])
++	case kind == xdpProgramType && bytes.Equal(info[8:16], ciliumDeadCodeProbeTag[:8]) &&
++		order.Uint32(info[20:24]) != 0:
++		copy(reply[:16], info[:16])
++		copy(reply[20:24], info[20:24])
++	default:
++		return nil
++	}
++	return reply
++}
+--- /dev/null
++++ b/sysbox-fs/seccomp/perf_output_lab_test.go
+@@ -0,0 +1,50 @@
++package seccomp
++
++import (
++	"encoding/binary"
++	"strings"
++	"testing"
++)
++
++func TestPerfOutputLabScope(t *testing.T) {
++	id := strings.Repeat("a", 64)
++	other := strings.Repeat("b", 64)
++	policy := []byte(id+" /lab/node\n"+other+" /lab/other\n"+id+" /lab/node/deeper\n")
++	for _, test := range []struct{ container, caller, want string }{
++		{id, "/lab/node/kubepods/pod", "/lab/node"},
++		{id, "/lab/node/deeper/pod", "/lab/node/deeper"},
++		{id, "/lab/node", "/lab/node"},
++		{id, "/lab/node-sibling/pod", ""},
++		{id, "/lab/other", ""},
++		{other, "/lab/node", ""},
++		{id, "/lab", ""},
++	} {
++		if got := perfOutputScope(policy, test.container, test.caller); got != test.want {
++			t.Errorf("%s under %q: got %q, want %q", test.container, test.caller, got, test.want)
++		}
++	}
++}
++
++func TestPerfOutputLabAttrs(t *testing.T) {
++	order := binary.NativeEndian
++	attr := make([]byte, 128)
++	order.PutUint32(attr[0:4], perfOutputType)
++	order.PutUint32(attr[4:8], uint32(len(attr)))
++	order.PutUint64(attr[8:16], perfOutputConfig)
++	order.PutUint64(attr[24:32], perfSampleRaw)
++	order.PutUint64(attr[40:48], perfWatermark)
++	order.PutUint32(attr[48:52], 1)
++	if !perfOutputAttr(attr) {
++		t.Fatal("Cilium-compatible BPF output request rejected")
++	}
++	for _, offset := range []int{0, 4, 8, 16, 24, 32, 40, 51, 52, 127} {
++		rejected := append([]byte(nil), attr...)
++		rejected[offset] = 255
++		if perfOutputAttr(rejected) {
++			t.Errorf("unapproved attribute byte at offset %d accepted", offset)
++		}
++	}
++	if perfOutputAttr(attr[:56]) || perfOutputAttr(append(attr, make([]byte, 16)...)) {
++		t.Fatal("unsupported perf_event_attr sizes accepted")
++	}
++}
+--- /dev/null
++++ b/sysbox-fs/seccomp/jit_info_lab_test.go
+@@ -0,0 +1,74 @@
++package seccomp
++
++import (
++	"bytes"
++	"encoding/binary"
++	"testing"
++)
++
++func TestCiliumJITProbeRequest(t *testing.T) {
++	for _, test := range []struct {
++		name           string
++		set            []int
++		wantTranslated bool
++		wantPermitted  bool
++	}{
++		{"empty", nil, false, true},
++		{"translated details", []int{20, 32}, true, true},
++		{"length only", []int{20}, false, false},
++		{"buffer only", []int{32}, false, false},
++		{"JIT instruction buffer", []int{24}, false, false},
++		{"map IDs buffer", []int{56}, false, false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			request := make([]byte, 256)
++			for _, index := range test.set {
++				request[index] = 1
++			}
++			translated, permitted := ciliumJITProbeRequest(request)
++			if translated != test.wantTranslated || permitted != test.wantPermitted {
++				t.Fatalf("got translated=%t permitted=%t", translated, permitted)
++			}
++		})
++	}
++}
++
++func TestCiliumJITProbeReply(t *testing.T) {
++	order := binary.NativeEndian
++	for _, test := range []struct {
++		name       string
++		kind       uint32
++		tag        [32]byte
++		translated bool
++		length     int
++		want       bool
++	}{
++		{"socket filter", socketFilterType, ciliumJITProbeTag, false, 16, true},
++		{"XDP", xdpProgramType, ciliumDeadCodeProbeTag, true, 20, true},
++		{"other tag", xdpProgramType, [32]byte{}, true, 20, false},
++		{"other program type", 3, ciliumJITProbeTag, false, 16, false},
++		{"socket filter raw request", socketFilterType, ciliumJITProbeTag, true, 16, false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			var info [24]byte
++			order.PutUint32(info[:4], test.kind)
++			order.PutUint32(info[4:8], 42)
++			copy(info[8:16], test.tag[:8])
++			order.PutUint32(info[16:20], 128)
++			order.PutUint32(info[20:24], 64)
++			reply := ciliumJITProbeReply(info, 256, test.translated)
++			if !test.want {
++				if reply != nil {
++					t.Fatal("unexpected experimental response")
++				}
++				return
++			}
++			want := make([]byte, 256)
++			copy(want[:16], info[:16])
++			copy(want[test.length:test.length+4], info[test.length:test.length+4])
++			if !bytes.Equal(reply, want) {
++				t.Fatal("response differs from permitted scalar fields")
++			}
++		})
++	}
++}
