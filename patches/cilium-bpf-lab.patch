@@ -264,7 +264,7 @@ index 0000000..6c4bab6
 +	}
 +	defer unix.Close(int(fd))
 +	if perfCallerScope(req.Pid, cntrID) != scope {
-+		return t.createErrorResponse(req.ID, syscall.EPERM)
++		return native
 +	}
 +	reply := perfOutputAddFD{ID: req.ID, Flags: notifAddFDSend, SrcFD: uint32(fd), NewFDFlags: unix.O_CLOEXEC}
 +	_, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(listener), ioctlNotifAddFD, uintptr(unsafe.Pointer(&reply)))
