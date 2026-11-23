@@ -76,11 +76,13 @@ class Contracts(unittest.TestCase):
             header[:4] = b"\x7fELF"
             header[5] = 1
             header[18:20] = (183).to_bytes(2, "little")
-            for name in ("sysbox-fs", "proc-mount-helper", "sysfs-mount-helper"):
+            for name in ("sysbox-fs", "sysbox-runc", "proc-mount-helper", "sysfs-mount-helper"):
                 (output / name).write_bytes(header + name.encode())
             record = build.manifest(lock, output)
             self.assertEqual(record["architecture"], "arm64")
-            self.assertEqual(set(record["output_sha256"]), {"sysbox-fs", "proc-mount-helper", "sysfs-mount-helper"})
+            patch = "patches/cilium-bpf-lab.patch"
+            self.assertEqual(record["input_sha256"][patch], build.sha256(ROOT / patch))
+            self.assertEqual(set(record["output_sha256"]), {"sysbox-fs", "sysbox-runc", "proc-mount-helper", "sysfs-mount-helper"})
             for name, digest in record["output_sha256"].items():
                 self.assertEqual(digest, build.sha256(output / name))
             self.assertNotIn(work, json.dumps(record))
@@ -118,7 +120,7 @@ class Contracts(unittest.TestCase):
         included = {rule[1:] for rule in rules[1:] if rule.startswith("!")}
         copied = set(re.findall(r"^COPY (?!\-\-)(\S+) ",
                                 (ROOT / "build/Dockerfile").read_text(), re.M))
-        self.assertEqual(copied, {"tests/upstream/fuse_mount_target_test.go","helper/fuse-mount-lookup.h","patches/fuse-overlay-mount.patch", "tests/upstream/mount_propagation_test.go", "tests/upstream/fuse_container_test.go", "tests/upstream/sysfs_dentry_test.go", "helper/sysfs-mount-helper.c", "patches/sysfs-transfer.patch", "tests/upstream/sysfs_policy_test.go", "tests/upstream/sysfs_snapshot_test.go", "tests/upstream/sysfs_metadata_test.go", "tests/upstream/fuse_identity_test.go", "helper/proc-mount-helper.c", "patches/proc-transfer.patch", "tests/upstream/proc_policy_test.go", "tests/unit/lifecycle.c"})
+        self.assertEqual(copied, {"patches/cilium-bpf-lab.patch", "tests/upstream/fuse_mount_target_test.go","helper/fuse-mount-lookup.h","patches/fuse-overlay-mount.patch", "tests/upstream/mount_propagation_test.go", "tests/upstream/fuse_container_test.go", "tests/upstream/sysfs_dentry_test.go", "helper/sysfs-mount-helper.c", "patches/sysfs-transfer.patch", "tests/upstream/sysfs_policy_test.go", "tests/upstream/sysfs_snapshot_test.go", "tests/upstream/sysfs_metadata_test.go", "tests/upstream/fuse_identity_test.go", "helper/proc-mount-helper.c", "patches/proc-transfer.patch", "tests/upstream/proc_policy_test.go", "tests/unit/lifecycle.c"})
         expected = copied | {"build/Dockerfile", "build/", "helper/", "patches/", "tests/", "tests/upstream/", "tests/unit/"}
         self.assertEqual(included, expected)
         self.assertTrue(all(not any(c in rule for c in "*?") for rule in included))

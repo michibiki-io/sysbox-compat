@@ -58,7 +58,7 @@ def elf_architecture(path):
 
 
 def manifest(lock, output):
-    names = ("sysbox-fs", "proc-mount-helper", "sysfs-mount-helper")
+    names = ("sysbox-fs", "sysbox-runc", "proc-mount-helper", "sysfs-mount-helper")
     architectures = {elf_architecture(output / name) for name in names}
     if len(architectures) != 1:
         raise ValueError("paired outputs have different architectures")

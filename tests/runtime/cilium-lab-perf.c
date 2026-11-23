@@ -46,6 +46,23 @@ static int probe(int invalid)
     return valid ? 0 : -1;
 }
 
+/* A native per-thread perf request that does not need a delegated event. */
+static int ordinary_perf(void)
+{
+    struct perf_event_attr attr = {
+        .size = sizeof(attr),
+        .type = PERF_TYPE_SOFTWARE,
+        .config = PERF_COUNT_SW_TASK_CLOCK,
+        .exclude_kernel = 1,
+    };
+    int fd = (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1,
+                          PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0)
+        return errno;
+    close(fd);
+    return 0;
+}
+
 /* The host supplies only this fixed, unattached feature probe. */
 static int send_jit_fd(int socket_fd)
 {
@@ -110,19 +127,31 @@ static int receive_jit_fd(void)
     return prog;
 }
 
-static int jit_probe(int prog)
+static void jit_probe(int prog, int unsupported)
 {
-    struct bpf_prog_info info = {0};
+    // The kernel ignores this input scalar when filling program info. The
+    // narrow Sysbox probe expects a zeroed input buffer and must pass it on.
+    struct bpf_prog_info info = {.type = unsupported ? UINT32_MAX : 0};
     union bpf_attr query = {
         .info.bpf_fd = prog,
         .info.info_len = sizeof(info),
         .info.info = (uintptr_t)&info,
     };
-    if (syscall(SYS_bpf, BPF_OBJ_GET_INFO_BY_FD, &query, sizeof(query)) != 0 ||
-        info.type != BPF_PROG_TYPE_SOCKET_FILTER || info.jited_prog_insns != 0 ||
-        info.xlated_prog_insns != 0)
-        return -1;
-    return (int)info.jited_prog_len;
+    if (syscall(SYS_bpf, BPF_OBJ_GET_INFO_BY_FD, &query, sizeof(query)) != 0) {
+        printf("%d\n", errno);
+        return;
+    }
+    if (info.type != BPF_PROG_TYPE_SOCKET_FILTER || info.jited_prog_insns != 0 ||
+        info.xlated_prog_insns != 0) {
+        puts("-1");
+        return;
+    }
+    // Program IDs differ across runs. Record whether the ID is visible.
+    printf("0 %u %d %u %u", info.type, info.id != 0,
+           info.jited_prog_len, info.xlated_prog_len);
+    for (size_t i = 0; i < sizeof(info.tag); ++i)
+        printf(" %u", (unsigned int)info.tag[i]);
+    putchar('\n');
 }
 
 int main(int argc, char **argv)
@@ -136,17 +165,19 @@ int main(int argc, char **argv)
         return 2;
     char command[32];
     while (fgets(command, sizeof(command), stdin)) {
-        int value;
         if (strcmp(command, "jit\n") == 0) {
-            value = jit_probe(prog);
+            jit_probe(prog, 0);
+        } else if (strcmp(command, "jit-unsupported\n") == 0) {
+            jit_probe(prog, 1);
         } else if (strcmp(command, "probe\n") == 0) {
-            value = probe(0);
+            printf("%d\n", probe(0));
         } else if (strcmp(command, "out-of-policy\n") == 0) {
-            value = probe(1);
+            printf("%d\n", probe(1));
+        } else if (strcmp(command, "ordinary-perf\n") == 0) {
+            printf("%d\n", ordinary_perf());
         } else {
             return 2;
         }
-        printf("%d\n", value);
         if (fflush(stdout) != 0)
             return 2;
     }
