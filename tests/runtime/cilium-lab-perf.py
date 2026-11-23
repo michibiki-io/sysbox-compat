@@ -4,6 +4,7 @@
 import argparse
 from contextlib import ExitStack, contextmanager
 import errno
+import json
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import uuid
 
 
 REGISTRATION = Path("/run/sysbox/perf-output-lab")
+COMMANDS = ("probe", "out-of-policy", "ordinary-perf", "jit", "jit-unsupported")
 
 
 def docker(*args):
@@ -22,7 +24,7 @@ def docker(*args):
 
 
 @contextmanager
-def test_container(runtime, image, probe, lab):
+def test_container(runtime, image, probe, lab, seccomp=None):
     name = f"sysbox-probe-{uuid.uuid4().hex}"
     with tempfile.TemporaryDirectory(prefix="jit-", dir=lab) as directory:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
@@ -31,10 +33,11 @@ def test_container(runtime, image, probe, lab):
             endpoint.chmod(0o666)
             listener.listen(1)
             listener.settimeout(10)
+            security = ("--security-opt", f"seccomp={seccomp}") if seccomp else ()
             docker("run", "--detach", "--pull", "never", "--runtime", runtime, "--name",
                    name, "--cap-add", "SYS_ADMIN", "--mount", f"type=bind,src={probe},dst=/perf-probe,readonly",
                    "--mount", f"type=bind,src={endpoint},dst=/jit-probe.sock,readonly",
-                   "--entrypoint", "sleep", image, "600")
+                   *security, "--entrypoint", "sleep", image, "600")
             try:
                 raw_id, raw_pid = docker("inspect", "-f", "{{.Id}} {{.State.Pid}}", name).split()
                 scope = next(line[3:] for line in Path(f"/proc/{int(raw_pid)}/cgroup").read_text().splitlines()
@@ -59,16 +62,32 @@ def test_container(runtime, image, probe, lab):
                 docker("rm", "--force", name)
 
 
-def probe_result(process, command="probe"):
+def probe_result(process, command):
     process.stdin.write(command + "\n")
     process.stdin.flush()
     ready, _, _ = select.select([process.stdout], [], [], 10)
     if not ready:
         raise TimeoutError("live probe did not reply")
     reply = process.stdout.readline().strip()
-    if not re.fullmatch(r"-?\d+", reply) or int(reply) < 0:
+    if not re.fullmatch(r"\d+( \d+)*", reply):
         raise RuntimeError(f"{command} failed to validate its file descriptor")
-    return int(reply)
+    fields = list(map(int, reply.split()))
+    if len(fields) == 1 and (not command.startswith("jit") or fields[0] != 0):
+        return fields
+    if command.startswith("jit") and len(fields) == 13 and fields[0] == 0:
+        return fields
+    raise RuntimeError(f"{command} returned unexpected fields: {reply}")
+
+
+def snapshot(process):
+    return {command: probe_result(process, command) for command in COMMANDS}
+
+
+def compare_native(process, native, label, commands=COMMANDS):
+    for command in commands:
+        observed = probe_result(process, command)
+        require(observed == native[command],
+                f"{label}: {command} matches native ({observed} vs {native[command]})")
 
 
 def require(condition, label):
@@ -82,13 +101,13 @@ class JobFailure(Exception):
 
 
 @contextmanager
-def register(outer_id, scope):
+def register(outer_id, scope, mode=0o400):
     with tempfile.NamedTemporaryFile(mode="w", dir=REGISTRATION.parent, delete=False) as record:
         staging = Path(record.name)
         try:
             record.write(f"{outer_id} {scope}\n")
             record.flush()
-            os.fchmod(record.fileno(), 0o400)
+            os.fchmod(record.fileno(), mode)
             os.link(staging, REGISTRATION)
         finally:
             staging.unlink()
@@ -105,8 +124,8 @@ def main():
     parser.add_argument("probe", type=Path, help="compiled static cilium-lab-perf.c")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--baseline-only", action="store_true")
-    mode.add_argument("--native-results", type=int, nargs=2, metavar=("PERF", "JIT"),
-                      help="baseline perf errno or zero, and baseline JIT length")
+    mode.add_argument("--native-results", type=Path,
+                      help="JSON results from the unmodified baseline runtime")
     args = parser.parse_args()
     lab = args.lab.resolve(strict=True)
     if (os.geteuid() != 0 or os.environ.get("DOCKER_HOST") != f"unix://{lab}/docker.sock"
@@ -117,39 +136,69 @@ def main():
         parser.error("use a pinned local image ID")
 
     probe = args.probe.resolve(strict=True)
-    if args.baseline_only:
-        with test_container("sysbox-baseline", args.image, probe, lab) as (_, _, baseline):
-            print(probe_result(baseline), probe_result(baseline, "jit"), flush=True)
-        return
-    native_perf, native_jit = args.native_results
-    with ExitStack() as stack:
-        disabled = stack.enter_context(test_container("sysbox-lab-off", args.image, probe, lab))[2]
-        outer, scope, active = stack.enter_context(test_container("sysbox-lab", args.image, probe, lab))
-        other_outer, other_scope, other = stack.enter_context(test_container("sysbox-lab", args.image, probe, lab))
-        require(probe_result(disabled) == native_perf, "routing disabled matches the unpatched runtime")
-        require(probe_result(disabled, "jit") == native_jit, "routing disabled preserves native JIT visibility")
-        require(probe_result(active) == errno.EPERM, "unregistered request denied")
-        require(probe_result(active, "jit") == native_jit, "unregistered request preserves native JIT visibility")
-        require(scope != other_scope, "jobs occupy different cgroups")
-        with register(other_outer, scope):
-            require(probe_result(other) == errno.EPERM, "registered ID in a different cgroup denied")
-            require(probe_result(other, "jit") == native_jit, "JIT preserves native visibility in a mismatched cgroup")
-        for failing in (False, True):
-            try:
-                with register(outer, scope):
-                    require(probe_result(active) == 0, "registered request opened a usable perf ring")
-                    require(probe_result(active, "jit") > native_jit, "registered JIT response exposes a length")
-                    require(probe_result(other) == errno.EPERM, "other job denied")
-                    require(probe_result(other, "jit") == native_jit, "other job keeps native JIT visibility")
-                    require(probe_result(active, "out-of-policy") == errno.EPERM, "unsupported perf attributes denied")
-                    if failing:
-                        raise JobFailure()
-            except JobFailure:
-                pass
-            label = "failed job" if failing else "successful job"
-            require(not REGISTRATION.exists(), f"{label} registration removed")
-            require(probe_result(active) == errno.EPERM, f"{label} live requester denied after removal")
-            require(probe_result(active, "jit") == native_jit, f"{label} live requester returned to native JIT visibility")
+    # An existing OCI filter should take precedence even with registration.
+    # A distinct errno shows the active response came from that filter.
+    seccomp = lab / "deny-compatibility.json"
+    seccomp.write_text(json.dumps({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+            {"names": ["perf_event_open", "bpf"], "action": "SCMP_ACT_ERRNO",
+             "errnoRet": errno.EACCES},
+        ],
+    }))
+    try:
+        if args.baseline_only:
+            with test_container("sysbox-baseline", args.image, probe, lab) as (_, _, baseline):
+                native = snapshot(baseline)
+            with test_container("sysbox-baseline", args.image, probe, lab, seccomp) as (_, _, denied):
+                blocked = snapshot(denied)
+            print(json.dumps({"native": native, "blocked": blocked}), flush=True)
+            return
+
+        results = json.loads(args.native_results.read_text())
+        native, blocked = results["native"], results["blocked"]
+        require(native["ordinary-perf"] == [0], "ordinary perf succeeds natively")
+        require(native["probe"] != [0], "native Cilium perf request needs delegation")
+        require(len(native["jit"]) == 13, "native socket-filter metadata is readable")
+        require(all(result == [errno.EACCES] for result in blocked.values()),
+                "OCI seccomp fixture returns EACCES on the baseline")
+        with ExitStack() as stack:
+            active_args = ("sysbox-standard", args.image, probe, lab)
+            outer, scope, active = stack.enter_context(test_container(*active_args))
+            other_outer, other_scope, other = stack.enter_context(test_container(*active_args))
+            denied_outer, denied_scope, denied = stack.enter_context(test_container(*active_args, seccomp))
+            require(scope != other_scope, "jobs occupy different cgroups")
+            compare_native(active, native, "missing registration")
+            with register(outer, scope, mode=0o420):
+                compare_native(active, native, "invalid registration permissions")
+            with register(other_outer, scope):
+                compare_native(active, native, "wrong container ID")
+                compare_native(other, native, "registered ID with wrong cgroup")
+            with register(denied_outer, denied_scope):
+                compare_native(denied, blocked, "OCI seccomp denial with valid registration")
+
+            for failing in (False, True):
+                try:
+                    with register(outer, scope):
+                        require(probe_result(active, "probe") == [0],
+                                "registered request opened a usable perf ring")
+                        jit = probe_result(active, "jit")
+                        require(len(jit) == 13 and jit[1:3] == native["jit"][1:3] and
+                                jit[3] > native["jit"][3] and jit[4] == 0 and
+                                jit[5:] == native["jit"][5:],
+                                "registered JIT response adds only the allowed feature metadata")
+                        compare_native(active, native, "registered caller outside compatibility scope",
+                                       ("ordinary-perf", "out-of-policy", "jit-unsupported"))
+                        compare_native(other, native, "other job during registration")
+                        if failing:
+                            raise JobFailure()
+                except JobFailure:
+                    pass
+                label = "failed job" if failing else "successful job"
+                require(not REGISTRATION.exists(), f"{label} registration removed")
+                compare_native(active, native, f"{label}: same live requester after removal")
+    finally:
+        seccomp.unlink()
 
 
 if __name__ == "__main__":

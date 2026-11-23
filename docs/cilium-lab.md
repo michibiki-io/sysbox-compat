@@ -1,4 +1,4 @@
-# Cilium compatibility experiment / Cilium 互換性の試験
+# Cilium compatibility / Cilium 互換性
 
 ## Contents / 目次
 
@@ -7,71 +7,81 @@
 
 ## English
 
-### Build and focused tests
+### Standard build and host requirements
 
-The release recipe still applies only the proc, sysfs, and FUSE patches. The Cilium
-lab build applies a fourth patch to the pinned Sysbox sources and builds a separate
-`sysbox-fs` and `sysbox-runc` pair. It runs the Go tests for registration scope, perf
-attributes, and the two JIT responses, and writes input and output hashes to
-`manifest.json`.
+`python3 scripts/build.py` applies the proc, sysfs, FUSE, and Sysbox Cilium
+compatibility patches to the pinned v0.7.1 sources. It tests default routing,
+registration scope, the perf event target and arguments, and both JIT probes.
+Install `sysbox-fs` and `sysbox-runc` from the same manifest alongside the two
+mount helpers. The pair routes the supported calls without
+`SYSBOX_EXPERIMENT_PERF_OUTPUT`. Keep the existing OCI seccomp policy in place.
+A denial in that policy takes precedence, so the intended workload must already
+use a profile that admits these notifications. Native amd64 and arm64 callers
+are eligible for delegation. Other ABIs retain kernel behavior for these calls.
 
-From this repository, with an initialized Sysbox v0.7.1 checkout and its pinned
-submodules available at `$sysbox_source`:
+The host must prepare cgroup v2, the delegated bpffs and BPF token used by the
+Cilium workload, and the registered cgroup scope. A trusted host process writes
+the root-owned, non-group/world-writable regular file
+`/run/sysbox/perf-output-lab`. Each line contains the full outer Sysbox
+container ID and its authorized absolute cgroup path. Register the job's
+cgroup, then remove the entry at job completion. The kernel must support
+seccomp user notifications, the continue and FD-injection operations, and
+cgroup-scoped perf events.
+
+Requests outside an authorized cgroup or supported request shape continue in
+the kernel. A delegated perf event is active only while a task in the registered
+cgroup subtree runs on the event CPU. The checks below verify the target FD,
+event flags, and ring setup. They do not measure event delivery. Removing a
+registration returns subsequent requests to native behavior. FDs already issued
+follow the kernel's lifetime rules. Cilium JIT probe responses are limited to
+the documented scalars. The XDP probe response leaves the instruction buffer
+untouched.
+
+### Disposable runtime comparison
+
+Use a disposable Sysbox setup with private mount and daemon state,
+`$lab/run-sysbox` mounted at `/run/sysbox`, and an independent Docker daemon
+at `unix://$lab/docker.sock`. Install the matching binaries and helpers from
+the standard build in the candidate setup. Keep an unmodified runtime and FS
+pair for the baseline. Register the two runtime names in their respective
+daemon configurations.
+
+- `sysbox-baseline` invokes the original runtime with the original FS daemon.
+- `sysbox-standard` invokes the standard build with its matching FS daemon.
+
+Use the same pinned local image and probe for both runs. The comparison host
+must allow a native caller to open a per-thread software perf event, and the
+CPU-wide Cilium request must need delegation. Run each command inside its
+respective disposable environment with its own `DOCKER_HOST`.
 
 ```sh
-python3 scripts/build-cilium-lab.py "$sysbox_source" --check-only
-python3 scripts/build-cilium-lab.py "$sysbox_source" --output ./dist/cilium-lab
-cc -O2 -Wall -Wextra -Werror -static -o ./dist/cilium-lab/perf-probe tests/runtime/cilium-lab-perf.c
+python3 scripts/build.py
+cc -O2 -Wall -Wextra -Werror -static -o ./dist/perf-probe tests/runtime/cilium-lab-perf.c
+
+# Original pair
+python3 tests/runtime/cilium-lab-perf.py "$lab" "$image_id" "$probe" --baseline-only > "$native_results"
+
+# Standard pair with SYSBOX_EXPERIMENT_PERF_OUTPUT absent
+python3 tests/runtime/cilium-lab-perf.py "$lab" "$image_id" "$probe" --native-results "$native_results"
 ```
 
-Repeat the application check and opt-in build whenever the pinned inputs or earlier
-patches change. The repository's standard CI builds the release variant.
-
-Use a disposable Sysbox installation on cgroup v2. Set up a private mount namespace
-with `$lab/run-sysbox` mounted on `/run/sysbox`, separately mounted Sysbox state,
-and an independent Docker daemon on `unix://$lab/docker.sock`. Use the existing
-paired helpers with the lab binaries. Register the following runtime names in
-the disposable daemon.
-
-- `sysbox-baseline` invokes the original Sysbox runtime. Run the baseline with the original Sysbox FS daemon.
-- `sysbox-lab-off` invokes the lab runtime without the environment variable below.
-- `sysbox-lab` invokes the lab runtime through a host-owned wrapper that sets `SYSBOX_EXPERIMENT_PERF_OUTPUT=1`. The two lab runtime names use the lab Sysbox FS daemon.
-
-Use the same local image ID and static probe binary for both runs. Run the
-following commands in their respective private mount namespaces with
-`DOCKER_HOST` pointing to each disposable daemon.
-
-```sh
-# With the original FS daemon, save the two numbers printed to stdout.
-python3 tests/runtime/cilium-lab-perf.py "$lab" "$image_id" "$probe" --baseline-only
-
-# With the lab FS daemon, pass both recorded numbers.
-python3 tests/runtime/cilium-lab-perf.py "$lab" "$image_id" "$probe" --native-results "$native_perf" "$native_jit"
-```
-
-The perf test starts two live contenders under the experiment and one with routing
-disabled. It compares disabled behavior to the original runtime, checks that the
-enabled path rejects a missing or mismatching registration, and verifies that an
-eligible request opens a close-on-exec FD with a usable perf ring. It removes the
-registration after both a successful and a deliberately failed job while the same
-requester stays alive. Removal blocks subsequent requests. FDs already issued
-remain subject to the kernel's existing lifetime rules.
-
-The JIT unit tests check the request and response for the socket-filter and XDP
-probes and reject unsupported buffers, program types, and tags. The live JIT
-check uses one fixed, unattached socket-filter probe FD supplied by the disposable
-host and compares the result with the native kernel response when the experiment
-is disabled, unregistered, mismatched, or removed. The live socket-filter tag comparison
-was validated on Linux 6.18.44. The focused XDP check covers the unit test.
-It does not capture an XDP probe reply from the live listener. A different
-kernel program tag uses the native path. XDP may ask for a translated
-instruction buffer, but the lab returns a scalar length and leaves that buffer
-untouched. Native BPF behavior applies outside the lab authorization.
+The harness compares native perf results and BPF visibility when registration
+is missing, invalid, assigned to a different job, or removed. It checks
+unsupported requests from a registered caller and an existing OCI seccomp
+denial. The registered perf request must open a close-on-exec FD and a usable
+ring. The live JIT check uses a fixed, unattached socket-filter probe. XDP
+response checks run in the Go unit tests. Record the architecture, kernel and
+Sysbox versions, SHA-256 of the two components launched on each side, the
+tested revision, and any checks that could not run.
 
 ### Cilium warnings
 
 The earlier Cilium 1.20.4 run on Linux 6.18.44 (amd64) made both agents Ready and
-passed all five catalog network cases. The same run logged these two warnings.
+passed all five catalog network cases. The same run logged these two warnings. The later [catalog kind job on the NixOS
+runner](https://github.com/michibiki-io/kubara-catalogs/actions/runs/45242975883/job/137935137286)
+passed all 13 tests with the stock v1.20.4 Agent and the test capability settings.
+That run used the earlier Sysbox configuration and did not include the two
+warning-specific recovery checks below.
 
 | Warning | Effect established from the Cilium source | Test coverage |
 | --- | --- | --- |
@@ -136,36 +146,53 @@ consume this patch.
 
 ## 日本語
 
-### ビルドと個別テスト
+### 標準ビルドとホスト側の前提
 
-通常のリリースビルドには既存 3 パッチを適用します。試験用ビルドには
-Cilium 用のパッチも適用し、`sysbox-fs` と `sysbox-runc` を別に出力します。
-登録範囲、perf 属性、JIT プローブ 2 種を Go テストで検証し、入出力の
-ハッシュを `manifest.json` に記録します。
+`python3 scripts/build.py` は固定した v0.7.1 のソースに proc、sysfs、
+FUSE、Sysbox の Cilium 互換パッチを適用します。既定の通知設定、登録範囲、
+perf イベントに渡す引数と cgroup、JIT プローブ 2 種をテストします。
+`sysbox-fs` と `sysbox-runc` はマウント用ヘルパーと同じ manifest
+に記録されたバイナリを導入してください。
+`SYSBOX_EXPERIMENT_PERF_OUTPUT` の設定は不要です。既存の OCI seccomp
+による拒否は Sysbox の通知より優先されます。ワークロードには対象の通知を許す
+既存のプロファイルを使います。委譲は amd64 と arm64 のネイティブ ABI が対象です。
+ほかの ABI では対象の呼び出しをカーネルに委ねます。
 
-上記のコマンドで、固定した Sysbox v0.7.1 ソースへの適用確認、試験ビルド、
-probe のコンパイルを実行できます。固定ソースや既存パッチの変更時は、
-適用確認と試験ビルドを再実行します。通常 CI はリリース用ビルドを検証します。
-実機テストは cgroup v2 の
-使い捨て環境で実行します。まず元のバイナリでネイティブの結果を取り、
-試験用バイナリでは通知無効時の結果が一致することを確認します。
-通知を有効にすると、登録済みの cgroup で perf FD を開いてリングを
-`mmap` できます。未登録と別ジョブからの要求、対象外の属性は拒否します。
-登録削除は正常終了と制御された失敗で試し、同じプロセスからの再要求が
-拒否されることを確認します。すでに発行された FD の寿命はカーネルに従います。
+ホストには cgroup v2、Cilium 用に委譲する bpffs と BPF token が必要です。
+ジョブの実行環境を管理するホストプロセスが、コンテナの完全な ID と
+cgroup の絶対パスを `/run/sysbox/perf-output-lab` に 1 行ずつ登録し、
+ジョブ終了時にその登録を削除します。登録には root 所有の通常ファイルを使い、
+グループとその他のユーザーには書き込み権限を与えません。カーネルには
+seccomp 通知、通知の継続と FD の受け渡し、cgroup 単位の perf イベントが必要です。
 
-JIT の個別テストでは socket filter と XDP の要求と応答を確認します。
-実機試験では固定の socket filter の FD で、無効時・未登録時・別ジョブ・
-登録削除後の応答を元のカーネル応答と比較します。socket filter のタグ照合は
-Linux 6.18.44 の実機で確認しました。XDP の個別検証は単体テストで行い、
-実機のリスナーが返した XDP の応答は採取していません。タグが一致しない場合は
-カーネル本来の応答になります。
-XDP には変換後の命令列の長さを返し、命令バッファには書き込みません。
+登録対象外の要求と、対応範囲外の要求はカーネルに委ねます。委譲された perf
+イベントは、登録した cgroup またはその子孫のタスクが対象 CPU で実行されている間に
+有効になります。以下の確認は対象 FD、フラグ、リングの取得までを検証します。
+イベントの到達は検証範囲に含みません。登録削除後の要求はカーネルに委ね、
+すでに発行した FD の寿命はカーネルの仕様に従います。XDP には変換後の
+命令列の長さを返し、命令バッファには書き込みません。
+
+### 使い捨て環境での比較
+
+上記のコマンドを、プライベートなマウントと独立した Docker デーモンを持つ
+使い捨て環境で実行します。同じイメージと probe で、未改変のペアと
+標準ビルドのペアを比較します。未改変側では、スレッド単位の通常の perf
+イベントを開けることと、CPU 全体を対象とする Cilium の要求に委譲が必要なことを
+確認します。登録なし、登録不正、別ジョブ、正常終了と失敗による登録削除後を
+比較します。登録済みの呼び出し元による対象外の要求と、既存の OCI seccomp
+による拒否も確認します。実機 JIT テストでは固定の socket-filter を使います。
+XDP の応答は Go の単体テストで確認します。アーキテクチャ、カーネルと
+Sysbox の版、両側で起動したバイナリの SHA-256、対象リビジョン、未実施項目を
+記録します。
 
 ### Cilium の警告
 
 Linux 6.18.44 の amd64 環境で Cilium 1.20.4 の両 Agent が Ready になり、
-カタログのネットワークテスト 5 件が通りました。同じ実行では、TCX
+カタログのネットワークテスト 5 件が通りました。その後の
+[NixOS runner の kind ジョブ](https://github.com/michibiki-io/kubara-catalogs/actions/runs/45242975883/job/137935137286)
+では、未改変の v1.20.4 Agent とテスト用の capability 設定で 13 件すべてが
+通りました。この結果は以前の Sysbox 構成で得たもので、以下の警告に固有の
+復旧試験は含みません。最初の実行では、TCX
 アタッチの照会に失敗すると watchdog がプログラムの再ロード要否を
 判定できませんでした。また、トレーシングプログラムをロードできず、
 削除・異常バックエンドへの既存ソケットを強制終了するジョブが起動しませんでした。

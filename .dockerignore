@@ -22,3 +22,4 @@
 !tests/upstream/mount_propagation_test.go
 !helper/fuse-mount-lookup.h
 !tests/upstream/fuse_mount_target_test.go
+!patches/cilium-bpf-lab.patch

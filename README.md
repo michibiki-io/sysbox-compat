@@ -33,9 +33,9 @@ python3 scripts/build.py
 python3 scripts/build.py --platform linux/arm64 --output dist
 ```
 
-The default is a native build. `dist/` receives `sysbox-fs`, `proc-mount-helper`, `sysfs-mount-helper` and `manifest.json` using BuildKit local output from a scratch stage. The manifest records the output ELF architecture, component revisions, builder digest, generator version and input/output SHA-256 hashes without machine identities or local paths. Treat the three binaries as one build. Set `SYSBOX_PROC_TRANSFER_HELPER` in the `sysbox-fs` process environment to the trusted helper executable's absolute path; an unset variable leaves the original proc mount path active. Protect all three executables and that environment from container callers. Host deployment configuration is outside this repository.
+The default is a native build. `dist/` receives `sysbox-fs`, `sysbox-runc`, `proc-mount-helper`, `sysfs-mount-helper`, and `manifest.json` using BuildKit local output from a scratch stage. The manifest records the output ELF architecture, component revisions, builder digest, generator version and input/output SHA-256 hashes without machine identities or local paths. Install the binaries from the same build. The Cilium compatibility handlers require the matching `sysbox-fs` and `sysbox-runc`; see [Cilium compatibility](docs/cilium-lab.md) for host prerequisites. Set `SYSBOX_PROC_TRANSFER_HELPER` in the `sysbox-fs` process environment to the trusted helper executable's absolute path; an unset variable leaves the original proc mount path active. Protect the executables and that environment from container callers. Host deployment configuration is outside this repository.
 
-[build/sources.lock.json](build/sources.lock.json) is the authoritative pin source. The wrapper supplies its values as Docker build arguments, checks source integrity hashes, and the builder checks root/component commits after recursive submodule initialization. IPC protobuf generation with `protoc-gen-go` v1.3.5 runs before building `sysbox-fs`. A focused upstream-package regression test verifies read-only policy normalization before nested dispatch without executing a helper or changing mounts. The patch retains upstream component paths and is applied at the Sysbox root. The namespace-entry C code is linked into `sysbox-fs`; standalone `sysbox-runc` and `sysbox-mgr` need no replacement for this patch.
+[build/sources.lock.json](build/sources.lock.json) is the authoritative pin source. The wrapper supplies its values as Docker build arguments, checks source integrity hashes, and the builder checks root/component commits after recursive submodule initialization. IPC protobuf generation with `protoc-gen-go` v1.3.5 runs before building `sysbox-fs`. A focused upstream-package regression test verifies read-only policy normalization before nested dispatch without executing a helper or changing mounts. The patch retains upstream component paths and is applied at the Sysbox root. The namespace-entry C code is linked into `sysbox-fs`. The bundled `sysbox-runc` supplies the Cilium notifications. The build uses upstream `sysbox-mgr`.
 
 Pinned inputs and recorded hashes do not establish byte-identical rebuilds. Builder apt repositories and upstream Go module availability remain external dependencies. A successful build on another architecture is compilation evidence only, not runtime validation. This repository publishes source, not binaries.
 
@@ -79,7 +79,7 @@ CI runs focused checks and a native container build from public inputs. It does 
 - [Design](docs/design.md): procfs transfer flow and the internal daemon/helper contract.
 - [Security model](docs/security-model.md): authorization, namespace isolation and registered procfs protections.
 - [Compatibility](docs/compatibility.md): validated conditions, review correction checks and remaining limitations.
-- [Cilium compatibility experiment](docs/cilium-lab.md)
+- [Cilium compatibility](docs/cilium-lab.md)
 
 ### License
 
@@ -87,7 +87,7 @@ Original helper, validation, build tooling and documentation use the root [MIT l
 
 ### Sysfs opt-in
 
-Issue #5 adds a separate opt-in sysfs path. Set the trusted daemon environment `SYSBOX_SYSFS_TRANSFER_HELPER` to the absolute path of `sysfs-mount-helper`. Unset preserves upstream sysfs dispatch. The proc helper source and FD protocol remain unchanged. Builds export all three binaries plus their manifest; deploy them from the same build. The new sysfs path and FUSE repair are separate from existing proc import acceptance. **AC7 is deferred/unrun until talos-sysbox-installer integration on genuine amd64/6.18.18-talos, Sysbox 0.7.1 and bwrap 0.12.0.** Compilation and supplemental arm64 tests do not establish that support.
+Issue #5 adds a separate opt-in sysfs path. Set the trusted daemon environment `SYSBOX_SYSFS_TRANSFER_HELPER` to the absolute path of `sysfs-mount-helper`. Unset preserves upstream sysfs dispatch. The proc helper source and FD protocol remain unchanged. Deploy the helpers and the Sysbox binaries from the same build. The new sysfs path and FUSE repair are separate from existing proc import acceptance. **AC7 is deferred/unrun until talos-sysbox-installer integration on genuine amd64/6.18.18-talos, Sysbox 0.7.1 and bwrap 0.12.0.** Compilation and supplemental arm64 tests do not establish that support.
 
 Use [runtime instructions](tests/runtime/README.md) for the new nonleader sysfs probe and direct lifecycle fixture. Preserve all outer masks/read-only mounts and the original bwrap proc and `/sys` bind checks. Production helpers never accept test checkpoint sockets. No installer, host daemon or cluster changes are supplied.
 
@@ -120,10 +120,10 @@ python3 scripts/build.py --platform linux/arm64 --output dist
 ```
 
 既定ではビルダーのネイティブアーキテクチャ向けにビルドします。
-scratch ステージから BuildKit のローカル出力を使い、`dist/` に `sysbox-fs`、`proc-mount-helper`、`sysfs-mount-helper`、`manifest.json` を出力します。
+scratch ステージから BuildKit のローカル出力を使い、`dist/` に `sysbox-fs`、`sysbox-runc`、`proc-mount-helper`、`sysfs-mount-helper`、`manifest.json` を出力します。
 manifest は ELF のアーキテクチャ、コンポーネントのリビジョン、ビルダーのダイジェスト、生成器のバージョン、入出力の SHA-256 を記録します。
 マシン識別情報やローカルパスは含めません。
-三つのバイナリは同じビルドの組み合わせとして扱います。
+バイナリは同じビルドの組み合わせで導入します。Cilium 互換機能には対応する `sysbox-fs` と `sysbox-runc` を使います。ホスト側の前提は [Cilium 互換性](docs/cilium-lab.md) を参照してください。
 `sysbox-fs` の環境変数 `SYSBOX_PROC_TRANSFER_HELPER` に、信頼する helper の実行ファイルの絶対パスを指定します。
 未設定の場合は従来の proc mount 処理を使用します。
 コンテナの呼び出し元が実行ファイルや環境変数を書き換えられないように管理します。
@@ -137,7 +137,7 @@ manifest は ELF のアーキテクチャ、コンポーネントのリビジョ
 `protoc-gen-go` v1.3.5 による IPC protobuf 生成を `sysbox-fs` のビルドより先に実行します。
 upstream パッケージ内の回帰テストで、helper の実行や mount の変更なしに、入れ子の名前空間を扱う分岐より前の読み取り専用属性の継承を確認します。
 パッチは upstream のコンポーネントパスを保持し、Sysbox のルートディレクトリで適用します。
-名前空間に入る処理の C コードは `sysbox-fs` にリンクされるため、このパッチのために単体の `sysbox-runc` や `sysbox-mgr` を置き換える必要はありません。
+名前空間に入る処理の C コードは `sysbox-fs` にリンクします。標準ビルドの `sysbox-runc` は Cilium 用の通知を設定します。`sysbox-mgr` は upstream 版を使います。
 
 入力の固定とハッシュの記録だけでは、再ビルド時にバイト単位で一致することを保証できません。
 ビルダーの apt リポジトリと upstream の Go モジュールの可用性は外部依存です。
@@ -206,7 +206,7 @@ CI は静的検査と、公開されている入力からのネイティブコ�
 - [設計](docs/design.md)：procfs 転送の流れとデーモン/helper 間の内部契約。
 - [安全性の設計](docs/security-model.md)：認証、名前空間の隔離、登録済みの procfs 保護。
 - [動作条件](docs/compatibility.md)：検証済みの条件、レビュー修正の検査、残る制約。
-- [Cilium 互換性の試験](docs/cilium-lab.md)
+- [Cilium 互換性](docs/cilium-lab.md)
 
 ### ライセンス
 
@@ -222,7 +222,7 @@ upstream の帰属表示とライセンスは [LICENSES/Apache-2.0.txt](LICENSES
 Issue #5 は sysfs 用の独立した opt-in 経路を追加します。
 信頼された daemon の環境変数 `SYSBOX_SYSFS_TRANSFER_HELPER` に `sysfs-mount-helper` の絶対パスを指定します。
 未設定時の sysfs dispatch と既存 proc helper のソース、FD 契約を維持します。
-ビルドは三つの binary と manifest を出力し、同じビルドの組み合わせとして管理します。
+ヘルパーと Sysbox バイナリは同じビルドの組み合わせで導入します。
 新しい sysfs と FUSE 修正の受け入れ条件は既存 proc の取り込み条件から独立しています。
 **AC7 の amd64、6.18.18-talos、Sysbox 0.7.1、bwrap 0.12.0 実環境検証は、talos-sysbox-installer 取り込み時まで deferred/unrun とします。**
 コンパイルや arm64 の補助検査では代替しません。
