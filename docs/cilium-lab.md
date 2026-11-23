@@ -90,9 +90,10 @@ disposable checkout.
 test "$(git -C "$cilium_source" rev-parse HEAD)" = beb276d2f38d4aadfda14710acf8d14a0f1ba723
 git -C "$cilium_source" apply --check "$PWD/patches/cilium-v1.20.4-warning-lab.patch"
 git -C "$cilium_source" apply "$PWD/patches/cilium-v1.20.4-warning-lab.patch"
-mkdir -p dist/cilium-warning
+mkdir -p dist/cilium-warning/.go-cache
 docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
   -v "$cilium_source:/src:ro" -v "$PWD/dist/cilium-warning:/out" -w /src \
+  -v "$PWD/dist/cilium-warning/.go-cache:/cache" -e GOCACHE=/cache \
   -e CGO_ENABLED=0 -e GOMAXPROCS=4 \
   docker.io/library/golang@sha256:2005724102f45917a63e9d092fc0e4ea56ea575048ce147caad5f5f61502c365 \
   go build -p 4 -mod=vendor -buildvcs=false \
