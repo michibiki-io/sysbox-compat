@@ -10,6 +10,8 @@ if test -r "$parameter"; then
     value=$(cat "$parameter")
     printf 'fuse.allow_sys_admin_access=%s\n' "$value"
     test "$value" = N
+else
+    printf 'fuse.allow_sys_admin_access unverified inside container; check on host\n'
 fi
 probe=${1:?path to mount probe required}
 test -x "$probe"
@@ -67,6 +69,30 @@ else
     failed=1
 fi
 
+# Exercise a burst above the per-container worker limit using distinct targets.
+pids=
+for index in $(seq 1 16); do
+    target="$fixture/merged/parallel-$index"
+    mkdir "$target"
+    "$probe" bind "$fixture/source" "$target" &
+    pids="$pids $!"
+done
+parallel=0
+for pid in $pids; do
+    wait "$pid" || parallel=1
+done
+for index in $(seq 1 16); do
+    target="$fixture/merged/parallel-$index"
+    if test "$(cat "$target/marker" 2>/dev/null)" != 'bind fixture'; then parallel=1; fi
+    umount "$target" 2>/dev/null || true
+done
+if test "$parallel" = 0; then
+    printf 'PASS 16 parallel FUSE bind mounts\n'
+else
+    printf 'FAIL parallel FUSE bind mounts\n' >&2
+    failed=1
+fi
+
 # The requester owns the new PID namespace but stays in the outer User
 # namespace. Check the namespace-local PID view and the registered mask.
 mask=$(stat -c '%d:%i' /proc/keys)
@@ -107,6 +133,8 @@ fi
 # Use an independently owned Network namespace for each fresh sysfs mount.
 # Verify the registered mask's identity on both protected transfer paths.
 sysmask=$(stat -c '%d:%i' /sys/firmware)
+sysmask_ro=$(awk '$5 == "/sys/firmware" { print ($6 ~ /(^|,)ro(,|$)/) }' /proc/self/mountinfo)
+test "$sysmask_ro" = 0 || test "$sysmask_ro" = 1
 for scope in outer child; do
     set -- --mount --net
     if test "$scope" = child; then
@@ -116,10 +144,13 @@ for scope in outer child; do
         "$1" sys-fd "$2"
         test "$(stat -c "%d:%i" "$2/firmware")" = "$3"
         test "$(stat -f -c "%t" "$2")" = 62656572
+        if test "$5" = 1; then
+            awk -v path="$2/firmware" "\$5 == path && \$6 ~ /(^|,)ro(,|\$)/ { seen = 1 } END { exit !seen }" /proc/self/mountinfo
+        fi
         if test "$4" = child && umount -l "$2/firmware"; then
             exit 1
         fi
-    ' sh "$probe" "$fixture/merged/$scope-sys" "$sysmask" "$scope"; then
+    ' sh "$probe" "$fixture/merged/$scope-sys" "$sysmask" "$scope" "$sysmask_ro"; then
         printf 'PASS %s-user sysfs protected procfd mount\n' "$scope"
     else
         printf 'FAIL %s-user sysfs protected procfd mount\n' "$scope" >&2

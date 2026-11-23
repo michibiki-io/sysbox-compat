@@ -3,8 +3,10 @@ package seccomp
 import (
 	"encoding/binary"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -176,28 +178,165 @@ func TestFuseWorkerReplyDeadline(t *testing.T) {
 
 func TestFuseWorkerSlots(t *testing.T) {
 	limit := fuseWorkerLimit{byContainer: make(map[string]int)}
-	for i := 0; i < fuseWorkersPerContainer; i++ {
-		if !limit.acquire("first") {
-			t.Fatalf("container slot %d unexpectedly refused", i)
+	valid := func() error { return nil }
+	reserve := func(id string) {
+		t.Helper()
+		if err := limit.acquire(id, time.Now().Add(time.Second), valid); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if limit.acquire("first") {
-		t.Fatal("container exceeded its worker budget")
+	for i := 0; i < fuseWorkersPerContainer; i++ {
+		reserve("first")
+	}
+	if err := limit.acquire("first", time.Now().Add(10*time.Millisecond), valid); err != unix.ETIMEDOUT {
+		t.Fatalf("full container queue = %v, want ETIMEDOUT", err)
 	}
 	for i := fuseWorkersPerContainer; i < fuseWorkersTotal; i++ {
-		if !limit.acquire(strconv.Itoa(i)) {
-			t.Fatalf("other container slot %d unexpectedly refused", i)
-		}
+		reserve(strconv.Itoa(i))
 	}
-	if limit.acquire("new") {
-		t.Fatal("global worker budget exceeded")
+
+	waiting := make(chan struct{})
+	taken := make(chan error, 1)
+	go func() {
+		err := limit.acquire("new", time.Now().Add(time.Second), func() error {
+			select {
+			case <-waiting:
+			default:
+				close(waiting)
+			}
+			return nil
+		})
+		taken <- err
+	}()
+	<-waiting
+	select {
+	case err := <-taken:
+		t.Fatalf("global budget unexpectedly returned %v", err)
+	case <-time.After(10 * time.Millisecond):
 	}
 	limit.release("first")
-	if !limit.acquire("new") {
-		t.Fatal("released global slot did not become available")
+	if err := <-taken; err != nil {
+		t.Fatalf("waiting requester missed released slot: %v", err)
 	}
 	limit.release("new")
 	if _, found := limit.byContainer["new"]; found {
 		t.Fatal("removed container still has a slot entry")
+	}
+
+	checks := 0
+	err := limit.acquire(strconv.Itoa(fuseWorkersPerContainer), time.Now().Add(time.Second), func() error {
+		checks++
+		if checks == 2 {
+			return unix.ENOENT
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("distinct container was blocked with global space available: %v", err)
+	}
+	limit.release(strconv.Itoa(fuseWorkersPerContainer))
+	reserve("first")
+	checks = 0
+	err = limit.acquire("first", time.Now().Add(time.Second), func() error {
+		checks++
+		if checks == 2 {
+			return unix.ENOENT
+		}
+		return nil
+	})
+	if err != unix.ENOENT {
+		t.Fatalf("queue failed to recheck notification liveness: %v", err)
+	}
+}
+
+type fuseWorkerTestWriter struct {
+	started chan struct{}
+	unblock chan struct{}
+}
+
+func (w *fuseWorkerTestWriter) Write(data []byte) (int, error) {
+	close(w.started)
+	<-w.unblock
+	return len(data), nil
+}
+
+func TestFuseWorkerProcess(t *testing.T) {
+	switch os.Getenv("SYSBOX_TEST_FUSE_WORKER") {
+	case "silent":
+		// Simulate delayed reaping without a FUSE mount or privileged test.
+		_, _ = os.Stdout.Write([]byte("started"))
+		time.Sleep(time.Minute)
+		return
+	case "exit":
+		os.Exit(0)
+	}
+
+	for _, mode := range []string{"silent", "exit"} {
+		t.Run(mode, func(t *testing.T) {
+			pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(pair[0])
+			child := os.NewFile(uintptr(pair[1]), "test worker")
+			defer child.Close()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestFuseWorkerProcess$")
+			cmd.Env = []string{"SYSBOX_TEST_FUSE_WORKER=" + mode}
+			cmd.ExtraFiles = []*os.File{child}
+			writer := &fuseWorkerTestWriter{started: make(chan struct{}), unblock: make(chan struct{})}
+			var unblock func()
+			if mode == "silent" {
+				cmd.Stdout = writer
+				var release sync.Once
+				unblock = func() { release.Do(func() { close(writer.unblock) }) }
+				defer unblock()
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer cmd.Process.Kill()
+			child.Close()
+			if mode == "silent" {
+				select {
+				case <-writer.started:
+				case <-time.After(3 * time.Second):
+					t.Fatal("worker did not start")
+				}
+			}
+
+			exited := make(chan struct{})
+			outcome := make(chan error, 1)
+			go func() {
+				_, _, err := awaitFuseWorker(cmd, pair[0], "/", time.Now().Add(200*time.Millisecond), func() {
+					close(exited)
+				})
+				outcome <- err
+			}()
+			want := unix.EIO
+			if mode == "silent" {
+				want = unix.ETIMEDOUT
+			}
+			select {
+			case err := <-outcome:
+				if err != want {
+					t.Fatalf("worker outcome = %v, want %v", err, want)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("reply waited for child reaping")
+			}
+			if mode == "silent" {
+				select {
+				case <-exited:
+					t.Fatal("slot released before Wait returned")
+				default:
+				}
+				unblock()
+			}
+			select {
+			case <-exited:
+			case <-time.After(3 * time.Second):
+				t.Fatal("slot not released after Wait returned")
+			}
+		})
 	}
 }

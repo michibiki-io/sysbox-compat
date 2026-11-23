@@ -67,10 +67,10 @@ index 4f5739e..71baddd 100644
  
 diff --git a/sysbox-fs/seccomp/fuse_target.go b/sysbox-fs/seccomp/fuse_target.go
 new file mode 100644
-index 0000000..e81ad36
+index 0000000..b1dd39c
 --- /dev/null
 +++ b/sysbox-fs/seccomp/fuse_target.go
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,613 @@
 +package seccomp
 +
 +import (
@@ -253,10 +253,14 @@ index 0000000..e81ad36
 +		files = append(files, os.NewFile(uintptr(duplicate), "pinned FUSE target"))
 +	}
 +
-+	if !fuseWorkers.acquire(m.cntr.ID()) {
-+		return nil, syscall.EAGAIN
-+	}
 +	key := m.cntr.ID()
++	deadline := time.Now().Add(15 * time.Second)
++	valid := func() error {
++		return libseccomp.NotifIDValid(libseccomp.ScmpFd(notifyFD), m.reqId)
++	}
++	if err := fuseWorkers.acquire(key, deadline, valid); err != nil {
++		return nil, err
++	}
 +	cmd := exec.Command(helper, args...)
 +	cmd.ExtraFiles = files
 +	cmd.Env = []string{}
@@ -266,8 +270,11 @@ index 0000000..e81ad36
 +		return nil, syscall.ENOTSUP
 +	}
 +	err = guard.WithChildReaperGuard(func() error {
-+		if err := libseccomp.NotifIDValid(libseccomp.ScmpFd(notifyFD), m.reqId); err != nil {
++		if err := valid(); err != nil {
 +			return err
++		}
++		if !time.Now().Before(deadline) {
++			return syscall.ETIMEDOUT
 +		}
 +		return cmd.Start()
 +	})
@@ -276,23 +283,10 @@ index 0000000..e81ad36
 +		return nil, err
 +	}
 +
-+	// The reply, rather than the wait status, authenticates the outcome.
-+	// The global reaper may collect an already exited worker. This goroutine
-+	// owns the slot until the process actually leaves, including after timeout.
-+	go func() {
-+		_ = cmd.Wait()
-+		fuseWorkers.release(key)
-+	}()
 +	_ = files[3].Close()
-+	if err := unix.Sendmsg(pair[0], []byte(path), nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL); err != nil {
-+		_ = cmd.Process.Kill()
-+		return nil, syscall.EIO
-+	}
-+	if err := pollFuseWorker(pair[0], 15*time.Second); err != nil {
-+		_ = cmd.Process.Kill()
-+		return nil, err
-+	}
-+	target, id, err := readFuseMountTarget(pair[0])
++	target, id, err := awaitFuseWorker(cmd, pair[0], path, deadline, func() {
++		fuseWorkers.release(key)
++	})
 +	if err != nil {
 +		logrus.Debugf("FUSE worker failed tid=%d operation=%s: %v", m.pid, operation, err)
 +		return nil, err
@@ -326,6 +320,24 @@ index 0000000..e81ad36
 +		return nil, err
 +	}
 +	return target, nil
++}
++
++// Do not hold the reaper guard or wait for the process to exit before
++// replying. A worker can remain in the kernel after SIGKILL.
++func awaitFuseWorker(cmd *exec.Cmd, socket int, path string, deadline time.Time, onExit func()) (*fuseMountTarget, uint64, error) {
++	go func() {
++		_ = cmd.Wait()
++		onExit()
++	}()
++	if err := unix.Sendmsg(socket, []byte(path), nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL); err != nil {
++		_ = cmd.Process.Kill()
++		return nil, 0, syscall.EIO
++	}
++	if err := pollFuseWorker(socket, time.Until(deadline)); err != nil {
++		_ = cmd.Process.Kill()
++		return nil, 0, err
++	}
++	return readFuseMountTarget(socket)
 +}
 +
 +// A FUSE-root request may still have the old root as its cwd after
@@ -539,19 +551,53 @@ index 0000000..e81ad36
 +	sync.Mutex
 +	active      int
 +	byContainer map[string]int
++	changed     chan struct{}
 +}
 +
 +var fuseWorkers = fuseWorkerLimit{byContainer: make(map[string]int)}
 +
-+func (l *fuseWorkerLimit) acquire(id string) bool {
-+	l.Lock()
-+	defer l.Unlock()
-+	if l.active >= fuseWorkersTotal || l.byContainer[id] >= fuseWorkersPerContainer {
-+		return false
++func (l *fuseWorkerLimit) acquire(id string, deadline time.Time, valid func() error) error {
++	var check *time.Ticker
++	var expiry *time.Timer
++	defer func() {
++		if check != nil {
++			check.Stop()
++			expiry.Stop()
++		}
++	}()
++
++	for {
++		if !time.Now().Before(deadline) {
++			return syscall.ETIMEDOUT
++		}
++		if err := valid(); err != nil {
++			return err
++		}
++		l.Lock()
++		if l.active < fuseWorkersTotal && l.byContainer[id] < fuseWorkersPerContainer {
++			l.active++
++			l.byContainer[id]++
++			l.Unlock()
++			return nil
++		}
++		if l.changed == nil {
++			l.changed = make(chan struct{})
++		}
++		changed := l.changed
++		l.Unlock()
++
++		if check == nil {
++			check = time.NewTicker(100 * time.Millisecond)
++			expiry = time.NewTimer(time.Until(deadline))
++		}
++		select {
++		case <-expiry.C:
++			return syscall.ETIMEDOUT
++		case <-check.C:
++			// An interrupted notification must not keep its place in line.
++		case <-changed:
++		}
 +	}
-+	l.active++
-+	l.byContainer[id]++
-+	return true
 +}
 +
 +func (l *fuseWorkerLimit) release(id string) {
@@ -561,6 +607,10 @@ index 0000000..e81ad36
 +	l.byContainer[id]--
 +	if l.byContainer[id] == 0 {
 +		delete(l.byContainer, id)
++	}
++	if l.changed != nil {
++		close(l.changed)
++		l.changed = nil
 +	}
 +}
 +
@@ -591,7 +641,7 @@ index 0000000..e81ad36
 +	control := make([]byte, unix.CmsgSpace(4))
 +	n, cn, flags, _, err := unix.Recvmsg(socket, data, control, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
 +	if err != nil {
-+		return nil, 0, err
++		return nil, 0, syscall.EIO
 +	}
 +	msgs, err := unix.ParseSocketControlMessage(control[:cn])
 +	if err != nil {
@@ -752,10 +802,18 @@ index fb83c9a..7f186e5 100644
  		return reject(err)
  	}
 diff --git a/sysbox-fs/seccomp/tracer.go b/sysbox-fs/seccomp/tracer.go
-index 17a946f..0a377d9 100644
+index 17a946f..b193da0 100644
 --- a/sysbox-fs/seccomp/tracer.go
 +++ b/sysbox-fs/seccomp/tracer.go
-@@ -654,9 +654,32 @@ func (t *syscallTracer) processMount(
+@@ -26,6 +26,7 @@ import (
+ 	"syscall"
+ 
+ 	"github.com/nestybox/sysbox-fs/domain"
++	"github.com/nestybox/sysbox-fs/sysfstransfer"
+ 	unixIpc "github.com/nestybox/sysbox-ipc/unix"
+ 	"github.com/nestybox/sysbox-libs/formatter"
+ 	linuxUtils "github.com/nestybox/sysbox-libs/linuxUtils"
+@@ -654,9 +655,29 @@ func (t *syscallTracer) processMount(
  
  	// Verify the process has the proper rights to access the target and
  	// update it in case it requires path resolution.
@@ -776,10 +834,7 @@ index 17a946f..0a377d9 100644
 +		}
 +		pinned, lookupErr := mount.resolveFuseMountTarget(resolvedTarget, target)
 +		if lookupErr != nil {
-+			if errno, ok := lookupErr.(syscall.Errno); ok {
-+				return t.createErrorResponse(req.ID, errno), nil
-+			}
-+			return nil, lookupErr
++			return t.createErrorResponse(req.ID, sysfstransfer.Errno(lookupErr)), nil
 +		}
 +		if pinned == nil {
 +			return t.createErrorResponse(req.ID, err), nil
@@ -790,7 +845,7 @@ index 17a946f..0a377d9 100644
  	}
  
  	// Collect process attributes required for mount execution.
-@@ -678,6 +701,20 @@ func (t *syscallTracer) processMount(
+@@ -678,6 +699,20 @@ func (t *syscallTracer) processMount(
  	return mount.process()
  }
  
@@ -811,7 +866,7 @@ index 17a946f..0a377d9 100644
  func (t *syscallTracer) processUmount(
  	req *sysRequest,
  	fd int32,
-@@ -729,6 +766,12 @@ func (t *syscallTracer) processUmount(
+@@ -729,6 +764,12 @@ func (t *syscallTracer) processUmount(
  	// update it in case it requires path resolution.
  	umount.Target, err = process.PathAccess(umount.Target, 0, true)
  	if err != nil {

@@ -53,7 +53,7 @@ static uint32_t fuse_lookup_decimal(const char *value)
     unsigned long parsed = strtoul(value, &end, 10);
     if (errno || end == value || *end || parsed > UINT32_MAX) {
         errno = EINVAL;
-        fuse_lookup_fail("invalid credential");
+        fuse_lookup_fail("invalid worker argument");
     }
     return parsed;
 }
@@ -99,10 +99,13 @@ static void fuse_lookup_requester_alive(void)
  * faithfully apply. Never clear an existing security restriction. */
 static bool fuse_lookup_readonly_attrs(uint32_t flags, struct mount_attr *attrs)
 {
+    if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
+        flags &= ~MS_MGC_MSK;
+
     const uint32_t atime = MS_NOATIME | MS_RELATIME | MS_STRICTATIME;
     const uint32_t required = MS_BIND | MS_REMOUNT | MS_RDONLY;
     const uint32_t supported = required | MS_REC | MS_SILENT | atime |
-        MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NODIRATIME;
+        MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NODIRATIME | MS_NOSYMFOLLOW;
     if ((flags & required) != required || (flags & ~supported))
         return false;
 
@@ -115,6 +118,8 @@ static bool fuse_lookup_readonly_attrs(uint32_t flags, struct mount_attr *attrs)
         attrs->attr_set |= MOUNT_ATTR_NOEXEC;
     if (flags & MS_NODIRATIME)
         attrs->attr_set |= MOUNT_ATTR_NODIRATIME;
+    if (flags & MS_NOSYMFOLLOW)
+        attrs->attr_set |= MOUNT_ATTR_NOSYMFOLLOW;
     if (flags & atime)
         attrs->attr_clr = MOUNT_ATTR__ATIME;
     switch (flags & atime) {

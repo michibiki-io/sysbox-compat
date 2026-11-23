@@ -10,6 +10,14 @@ case "$driver" in
     *) printf 'Expected fuse-overlayfs or overlay2\n' >&2; exit 2 ;;
 esac
 test "$(docker info --format '{{.Driver}}')" = "$driver"
+parameter=/sys/module/fuse/parameters/allow_sys_admin_access
+if test -r "$parameter"; then
+    value=$(cat "$parameter")
+    printf 'fuse.allow_sys_admin_access=%s\n' "$value"
+    test "$value" = N
+else
+    printf 'fuse.allow_sys_admin_access unverified inside container; check on host\n'
+fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 fixture=$(mktemp -d)
 label="sysbox-fuse-test-$$"
@@ -43,7 +51,9 @@ if test "$driver" = fuse-overlayfs; then
 else
     revision=$(docker image inspect "$FUSE_TEST_BUILDKIT" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
     test "$revision" = 412cc86ad3c4252b82e929f9b1b1ad167376ded8
-    printf 'BuildKit fixture source=%s\n' "$revision"
+    docker run --pull=never --rm --entrypoint /usr/bin/buildkitd "$FUSE_TEST_BUILDKIT" --version \
+        >"$fixture/worker-version"
+    grep -F "v0.35.1+sysbox-fixture $revision" "$fixture/worker-version"
     mkdir "$fixture/worker"
     printf 'FROM %s\nRUN apk add --no-cache fuse-overlayfs\n' \
         "$FUSE_TEST_BUILDKIT" >"$fixture/worker/Dockerfile"

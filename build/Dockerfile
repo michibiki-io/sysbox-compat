@@ -52,7 +52,7 @@ COPY tests/upstream/fuse_identity_test.go /src/sysbox/sysbox-fs/bazil/fs/lookup_
 RUN cd bazil && CGO_ENABLED=1 go test $(find fs -maxdepth 1 -name '*.go' ! -name '*_test.go' -print) fs/lookup_identity_test.go -run '^Test(LookupIdentityFreshAttributes|GetattrDispatchInode|NetworkReadDirDispatch)$' -count=1
 RUN CGO_ENABLED=1 go test ./mount -run '^TestSysfsRegistration(Snapshot|RootMetadata)$' -count=1
 RUN CGO_ENABLED=1 go test ./sysfstransfer
-RUN CGO_ENABLED=1 go test -tags 'netgo osusergo' ./seccomp -run '^Test(Proc(PolicyBeforeNestedTransfer|RequesterThreadPidfd|TransferInvalidNotificationDoesNotLaunch|TransferRealNotification)|RetryMountPropagationInKernel|FuseRequester(Descriptor|FilesystemIDs)|Fuse(TargetKeepsSelectedDescriptor|OverlayMountAncestry|BindAtimeOperation|WorkerReplyDeadline|WorkerSlots))$' -count=1
+RUN CGO_ENABLED=1 go test -tags 'netgo osusergo' ./seccomp -run '^Test(Proc(PolicyBeforeNestedTransfer|RequesterThreadPidfd|TransferInvalidNotificationDoesNotLaunch|TransferRealNotification)|RetryMountPropagationInKernel|FuseRequester(Descriptor|FilesystemIDs)|Fuse(TargetKeepsSelectedDescriptor|OverlayMountAncestry|BindAtimeOperation|WorkerReplyDeadline|WorkerSlots|WorkerProcess))$' -count=1
 RUN CGO_ENABLED=1 go build -buildvcs=false -trimpath -tags 'netgo osusergo' \
     -ldflags "-linkmode external -extldflags -static -X main.edition=Community -X main.version=0.7.1-proc-sysfs-transfer -X main.commitId=${FS_REV}+proc-sysfs-transfer" \
     -o /out/sysbox-fs ./cmd/sysbox-fs

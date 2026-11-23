@@ -14,6 +14,9 @@ int main(void)
                               MOUNT_ATTR_NODIRATIME | MOUNT_ATTR_NOATIME));
     assert(attrs.attr_clr == MOUNT_ATTR__ATIME);
     assert(!fuse_lookup_readonly_attrs(base | MS_SYNCHRONOUS, &attrs));
+    attrs = (struct mount_attr){0};
+    assert(fuse_lookup_readonly_attrs(base | MS_MGC_VAL | MS_NOSYMFOLLOW, &attrs));
+    assert(attrs.attr_set == (MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSYMFOLLOW));
     assert(!fuse_lookup_readonly_attrs(base | MS_NOATIME | MS_RELATIME, &attrs));
     assert(!fuse_lookup_readonly_attrs(base & ~MS_BIND, &attrs));
 

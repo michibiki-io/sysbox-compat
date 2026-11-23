@@ -188,6 +188,11 @@ func TestProcTransferRealNotification(t *testing.T) {
 	if _, err := runProcTransfer(int32(fd), request.ID, launch); err == nil || calls != 1 {
 		t.Fatalf("invalid original ID launched: %v calls=%d", err, calls)
 	}
+	t.Setenv("SYSBOX_PROC_TRANSFER_HELPER", filepath.Join(work, "never-launch"))
+	fuseRequest := syscallCtx{pid: request.Pid, reqId: request.ID}
+	if target, err := fuseRequest.runFuseTargetWorker(int32(fd), "/", "", "proc", "lookup", nil); err == nil || target != nil {
+		t.Fatalf("FUSE lookup accepted the invalid notification: %v, %v", target, err)
+	}
 	if err := libseccomp.NotifRespond(libseccomp.ScmpFd(fd), &libseccomp.ScmpNotifResp{ID: request.ID}); err == nil {
 		t.Fatal("success delivered to invalid original notification")
 	}
