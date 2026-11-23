@@ -29,6 +29,7 @@
   "generator": "github.com/golang/protobuf/protoc-gen-go@v1.3.5",
   "schema_version": 1,
   "source_sha256": {
+    "docs/cilium-lab.md": "35719b61986ef583e33c1ed3c1245cbe841640a12fe7e196f6a2ea728c3fa0ef",
     "docs/compatibility.md": "7bfc6ebee2462f06273392537f792a9beebdc7a48696c2e5883c5988446ac213",
     "helper/fuse-mount-lookup.h": "6f77ae66c662c511bddadbf487f5c4f652433f4f4f8f1522c8ae6fe7985ef930",
     "helper/proc-mount-helper.c": "aba64dfae89810f9ba08de7c94f1aae5745c26821446db81de7528f719d6e3fb",
@@ -61,7 +62,7 @@
     "tests/runtime/verify-sys.py": "896c115941a61389cfc8aee0103d5e1b6b133372811237c081bd645a7832295b",
     "tests/runtime/verify.c": "4f4f34542b062437089f985cf91168250f5d62ad3eae7479aeaae8422e02986c",
     "tests/runtime/verify.sh": "192aa9a6df70f6a2dcbfdfa3928a933e56734a07fd81a99da71442dd1575f312",
-    "tests/static/test_contracts.py": "55cf0c3b44efdd66dbdfcfc4c89c76ca3d8a6095083a6992f6853c4f8db38bf7",
+    "tests/static/test_contracts.py": "209b1d90765eda0086036153ea070dae3df701d5f72c83de7734143f4340df72",
     "tests/static/test_lifecycle.py": "e37dfe690b743a9e81167c89c98715e1b130ac7241be830fcfba96fe1c7a546c",
     "tests/static/test_proc_verifier.py": "7fc63ce2722ec9b73939bba815be74e016bd27e539665fcf5b67d7f52ad27696",
     "tests/static/test_sysfs.py": "9a8467bd47475a8548d0b4faefe4e8b90b16b2bac26d996e11883461d19d375a",
