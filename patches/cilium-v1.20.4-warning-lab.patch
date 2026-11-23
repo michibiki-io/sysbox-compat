@@ -109,7 +109,7 @@ index d6e38c2f..1c2d630f 100644
 +		tcx.Ifindex == uint32(iface.Attrs().Index) && info.Program != 0, nil
 +}
 diff --git a/pkg/datapath/sockets/sockets.go b/pkg/datapath/sockets/sockets.go
-index 5c34fa91..e789f6a1 100644
+index 5c34fa91..1dbca5e2 100644
 --- a/pkg/datapath/sockets/sockets.go
 +++ b/pkg/datapath/sockets/sockets.go
 @@ -332,13 +332,16 @@ func (sd *bpfSocketDestroyer) Destroy(logger *slog.Logger, f SocketFilter) error
@@ -126,7 +126,7 @@ index 5c34fa91..e789f6a1 100644
  		bpfSD, err := newBPFSocketDestroyer(l, sockRevNat4, sockRevNat6)
  		if errors.Is(err, ebpf.ErrNotSupported) {
  			l.Info("bpf_sock_destroy is not supported on the current kernel. Falling back to netlink-based socket destroyer")
-+		} else if netlinkAvailable && (errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
++		} else if netlinkAvailable && errors.Is(err, unix.EPERM) {
 +			l.Info("BPF socket destroyer unavailable with current permissions. Falling back to netlink", logfields.Error, err)
  		} else if err != nil {
  			return nil, fmt.Errorf("creating BPF socket destroyer: %w", err)

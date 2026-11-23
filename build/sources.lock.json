@@ -35,7 +35,7 @@
     "helper/proc-mount-helper.c": "aba64dfae89810f9ba08de7c94f1aae5745c26821446db81de7528f719d6e3fb",
     "helper/sysfs-mount-helper.c": "1c0319b8e9ab67418a70c579ba880772ae00cb15b0bda0d1b26fafdfe2e3760b",
     "patches/cilium-bpf-lab.patch": "b597d18fc0b3fd5cf76a19e0a980dacd44925969e5f1304106d5204c1ee0c12d",
-    "patches/cilium-v1.20.4-warning-lab.patch": "1c43664e15410af216dfe0fefa8b2a34f3fd9373c6854d9f218b30e8e590e746",
+    "patches/cilium-v1.20.4-warning-lab.patch": "c9918be5c8a4d4afa256ae9838b0fa2c3878805cc5dcfe50d3dc1850c04cac74",
     "patches/fuse-overlay-mount.patch": "bd2f4c1a737af8610bba37131d8e9755121e5df9fc145b68fa6ab049958ea4b6",
     "patches/proc-transfer.patch": "d7a6b3962fe4d58eeed0537660f226d3542bccb71dc0c29c8069b5d61fe88838",
     "patches/sysfs-transfer.patch": "6880096cc27c9709621f7125786a4f7d4c1234bff2109a35c008cca3711ab3de",
