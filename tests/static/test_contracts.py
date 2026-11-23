@@ -14,6 +14,7 @@ spec = importlib.util.spec_from_file_location("build_tool", ROOT / "scripts/buil
 build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 PUBLIC_FILES = {
+    "patches/cilium-bpf-lab.patch",
     "tests/runtime/buildkit-fuse-bind.patch",
     "tests/runtime/fuse-docker-build.sh", "tests/runtime/fuse-verify-spdx.py",
     "tests/upstream/fuse_mount_target_test.go",
