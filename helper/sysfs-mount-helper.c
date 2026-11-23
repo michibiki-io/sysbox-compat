@@ -68,8 +68,11 @@ static int relative_path(const char *p) {
  * argv4 is --lookup=relative-path or --open=relative-path. No raw tree FD
  * or write operation is exposed to the daemon or caller. */
 int main(int argc,char**argv){
+ int pinned_fuse=argc>1&&!strcmp(argv[1],"--pinned-fuse-target");
+ if(pinned_fuse){argc--;argv++;}
  guard();need(geteuid()==0,"root launcher");need(argc>=4&&argc<=133,"argument count");
  unsigned long uid=number(argv[1]),gid=number(argv[2]),flags=number(argv[3]);int backing=argc>4&&!strncmp(argv[4],"--",2), start=backing?5:4, count=argc-start;
+ need(!(backing&&pinned_fuse),"pinned target only for mount transfer");
  need(count<=128,"bounded protection count");need(uid<UINT32_MAX&&gid<UINT32_MAX,"mapped IDs");
  const char *resource=NULL;int lookup=0;
  if(backing){
@@ -82,8 +85,9 @@ int main(int argc,char**argv){
  need(!(flags&MS_RELATIME)||!(flags&MS_STRICTATIME),"exclusive atime flags");
  need(!(flags&~(MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_RELATIME|MS_STRICTATIME|MS_SILENT|MS_LAZYTIME)),"supported sysfs flags");
  need(ioctl(3,NS_GET_NSTYPE)==CLONE_NEWUSER&&ioctl(4,NS_GET_NSTYPE)==CLONE_NEWNS&&ioctl(5,NS_GET_NSTYPE)==CLONE_NEWUSER&&ioctl(6,NS_GET_NSTYPE)==CLONE_NEWNS&&ioctl(7,NS_GET_NSTYPE)==CLONE_NEWNET,"namespace types");
+ int same_user=pinned_fuse&&same(3,5);
  int parent;
- if(!(backing&&same(5,3))){parent=ioctl(5,NS_GET_PARENT);ck(parent,"requester user parent");need(same(parent,3),"direct child user namespace");close(parent);}
+ if(!same_user&&!(backing&&same(5,3))){parent=ioctl(5,NS_GET_PARENT);ck(parent,"requester user parent");need(same(parent,3),"direct child user namespace");close(parent);}
  int owner=ioctl(6,NS_GET_USERNS);ck(owner,"mount owner");need(same(owner,5),"requester mount owner");close(owner);
  owner=ioctl(7,NS_GET_USERNS);ck(owner,"network owner");
  int net_ok=same(owner,5)||same(owner,3);
@@ -94,7 +98,7 @@ int main(int argc,char**argv){
  owner=ioctl(4,NS_GET_USERNS);ck(owner,"outer mount owner");need(same(owner,3),"registered outer mount owner");close(owner);
  int launcher=open("/proc/self/ns/user",O_RDONLY|O_CLOEXEC);ck(launcher,"launcher user namespace");
  parent=ioctl(3,NS_GET_PARENT);ck(parent,"outer user parent");need(same(launcher,parent),"trusted parent-user launcher");close(launcher);close(parent);
- if(!backing){struct stat target;ck(fstat(8,&target),"target stat");need(S_ISDIR(target.st_mode),"directory target");}alive();
+ if(!backing&&!pinned_fuse){struct stat target;ck(fstat(8,&target),"target stat");need(S_ISDIR(target.st_mode),"directory target");}alive();
  /* Keep this worker outside all container PID namespaces. The trusted proc
   * metadata FD is private and closed before entering the requester mount ns.
   * No host mount or initial-user mount privilege is used. */
@@ -170,12 +174,21 @@ int main(int argc,char**argv){
  }
  /* A sacrificial child user namespace locks every protected submount. Its
   * detached tree is passed back to the mapped outer worker, never the sandbox. */
- int pair[2];ck(socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0,pair),"locker channel");pid_t locker=fork();ck(locker,"fork locker");
- if(!locker){guard();close(pair[0]);ck(unshare(CLONE_NEWUSER),"locker user");ck(prctl(PR_SET_DUMPABLE,1),"locker proc mapping ownership");char ready='R';ck(write(pair[1],&ready,1),"locker mapping ready");need(read(pair[1],&ready,1)==1&&ready=='A',"locker mapping acknowledgement");close(hostproc);ck(prctl(PR_SET_DUMPABLE,0),"locker nondumpable");ck(unshare(CLONE_NEWNS),"lock staged mount tree");int t=syscall(SYS_open_tree,AT_FDCWD,work,OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_RECURSIVE);ck(t,"clone locked sysfs tree");sendfd(pair[1],t);close(t);_exit(0);}
- close(pair[1]);char ready;need(read(pair[0],&ready,1)==1&&ready=='R',"locker ready protocol");
- putat(hostproc,locker,"uid_map","0 0 1\n");putat(hostproc,locker,"setgroups","deny");putat(hostproc,locker,"gid_map","0 0 1\n");
- ready='A';ck(write(pair[0],&ready,1),"locker mapped acknowledgement");close(hostproc);
- int tree=recvfd(pair[0]);close(pair[0]);int code=waitcode(locker);if(code)_exit(code);
+ int tree;
+ if(same_user){
+  /* The original same-user path keeps the registered masks and attributes.
+   * A separate user namespace and its mount locks are needed for child transfer. */
+  close(hostproc);
+  tree=syscall(SYS_open_tree,AT_FDCWD,work,OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_RECURSIVE);
+  ck(tree,"clone same-user sysfs tree");
+ }else{
+  int pair[2];ck(socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0,pair),"locker channel");pid_t locker=fork();ck(locker,"fork locker");
+  if(!locker){guard();close(pair[0]);ck(unshare(CLONE_NEWUSER),"locker user");ck(prctl(PR_SET_DUMPABLE,1),"locker proc mapping ownership");char ready='R';ck(write(pair[1],&ready,1),"locker mapping ready");need(read(pair[1],&ready,1)==1&&ready=='A',"locker mapping acknowledgement");close(hostproc);ck(prctl(PR_SET_DUMPABLE,0),"locker nondumpable");ck(unshare(CLONE_NEWNS),"lock staged mount tree");int t=syscall(SYS_open_tree,AT_FDCWD,work,OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_RECURSIVE);ck(t,"clone locked sysfs tree");sendfd(pair[1],t);close(t);_exit(0);}
+  close(pair[1]);char ready;need(read(pair[0],&ready,1)==1&&ready=='R',"locker ready protocol");
+  putat(hostproc,locker,"uid_map","0 0 1\n");putat(hostproc,locker,"setgroups","deny");putat(hostproc,locker,"gid_map","0 0 1\n");
+  ready='A';ck(write(pair[0],&ready,1),"locker mapped acknowledgement");close(hostproc);
+  tree=recvfd(pair[0]);close(pair[0]);int code=waitcode(locker);if(code)_exit(code);
+ }
  ck(umount2(work,MNT_DETACH),"discard private stage");ck(rmdir(work),"remove stage directory");
  ck(setns(6,CLONE_NEWNS),"enter sandbox mount");alive();
  /* Last operation is the atomic commit; every earlier failure leaves target

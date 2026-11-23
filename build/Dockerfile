@@ -27,12 +27,16 @@ RUN git clone --depth 1 --branch v0.7.1 https://github.com/nestybox/sysbox.git \
     && test "$(git -C sysbox-fs/bazil rev-parse HEAD)" = "$FUSE_REV"
 COPY patches/proc-transfer.patch /src/proc-transfer.patch
 COPY patches/sysfs-transfer.patch /src/sysfs-transfer.patch
-RUN cd /src/sysbox && patch -p1 < /src/proc-transfer.patch && patch -p1 < /src/sysfs-transfer.patch
+COPY patches/fuse-overlay-mount.patch /src/fuse-overlay-mount.patch
+RUN cd /src/sysbox && patch -p1 < /src/proc-transfer.patch \
+    && patch -p1 < /src/sysfs-transfer.patch && patch -p1 < /src/fuse-overlay-mount.patch
 RUN PATH="/go/bin:$PATH" make -C /src/sysbox/sysbox-ipc sysbox-ipc \
     && test -s /src/sysbox/sysbox-ipc/sysboxFsGrpc/sysboxFsProtobuf/sysboxFsProtobuf.pb.go \
     && test -s /src/sysbox/sysbox-ipc/sysboxMgrGrpc/sysboxMgrProtobuf/sysboxMgrProtobuf.pb.go
 WORKDIR /src/sysbox/sysbox-fs
 COPY tests/upstream/proc_policy_test.go /src/sysbox/sysbox-fs/seccomp/proc_policy_test.go
+COPY tests/upstream/fuse_mount_target_test.go /src/sysbox/sysbox-fs/seccomp/fuse_mount_target_test.go
+COPY tests/upstream/mount_propagation_test.go /src/sysbox/sysbox-fs/seccomp/mount_propagation_test.go
 COPY tests/unit/lifecycle.c /src/sysbox/sysbox-fs/seccomp/testdata/proc_lifecycle.c
 COPY tests/upstream/sysfs_policy_test.go /src/sysbox/sysbox-fs/sysfstransfer/policy_test.go
 COPY tests/upstream/sysfs_snapshot_test.go /src/sysbox/sysbox-fs/mount/sysfs_snapshot_test.go
@@ -48,13 +52,14 @@ COPY tests/upstream/fuse_identity_test.go /src/sysbox/sysbox-fs/bazil/fs/lookup_
 RUN cd bazil && CGO_ENABLED=1 go test $(find fs -maxdepth 1 -name '*.go' ! -name '*_test.go' -print) fs/lookup_identity_test.go -run '^Test(LookupIdentityFreshAttributes|GetattrDispatchInode|NetworkReadDirDispatch)$' -count=1
 RUN CGO_ENABLED=1 go test ./mount -run '^TestSysfsRegistration(Snapshot|RootMetadata)$' -count=1
 RUN CGO_ENABLED=1 go test ./sysfstransfer
-RUN CGO_ENABLED=1 go test -tags 'netgo osusergo' ./seccomp -run '^TestProc(PolicyBeforeNestedTransfer|RequesterThreadPidfd|TransferInvalidNotificationDoesNotLaunch|TransferRealNotification)$' -count=1
+RUN CGO_ENABLED=1 go test -tags 'netgo osusergo' ./seccomp -run '^Test(Proc(PolicyBeforeNestedTransfer|RequesterThreadPidfd|TransferInvalidNotificationDoesNotLaunch|TransferRealNotification)|RetryMountPropagationInKernel|FuseRequester(Descriptor|FilesystemIDs)|Fuse(TargetKeepsSelectedDescriptor|OverlayMountAncestry|BindAtimeOperation|WorkerReplyDeadline|WorkerSlots|WorkerProcess|LegacyMountFlags))$' -count=1
 RUN CGO_ENABLED=1 go build -buildvcs=false -trimpath -tags 'netgo osusergo' \
     -ldflags "-linkmode external -extldflags -static -X main.edition=Community -X main.version=0.7.1-proc-sysfs-transfer -X main.commitId=${FS_REV}+proc-sysfs-transfer" \
     -o /out/sysbox-fs ./cmd/sysbox-fs
 COPY helper/sysfs-mount-helper.c /src/sysfs-mount-helper.c
 RUN cc -O2 -Wall -Wextra -Werror -static /src/sysfs-mount-helper.c -o /out/sysfs-mount-helper
 COPY helper/proc-mount-helper.c /src/proc-mount-helper.c
+COPY helper/fuse-mount-lookup.h /src/fuse-mount-lookup.h
 RUN cc -O2 -Wall -Wextra -Werror -static /src/proc-mount-helper.c -o /out/proc-mount-helper
 FROM scratch AS export
 COPY --from=build /out/sysbox-fs /sysbox-fs

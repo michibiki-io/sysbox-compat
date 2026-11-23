@@ -18,3 +18,7 @@
 !tests/upstream/fuse_identity_test.go
 !tests/upstream/sysfs_dentry_test.go
 !tests/upstream/fuse_container_test.go
+!patches/fuse-overlay-mount.patch
+!tests/upstream/mount_propagation_test.go
+!helper/fuse-mount-lookup.h
+!tests/upstream/fuse_mount_target_test.go

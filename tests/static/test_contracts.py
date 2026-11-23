@@ -14,6 +14,12 @@ spec = importlib.util.spec_from_file_location("build_tool", ROOT / "scripts/buil
 build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 PUBLIC_FILES = {
+    "tests/runtime/buildkit-fuse-bind.patch",
+    "tests/runtime/fuse-docker-build.sh", "tests/runtime/fuse-verify-spdx.py",
+    "tests/upstream/fuse_mount_target_test.go",
+    "helper/fuse-mount-lookup.h", "tests/unit/fuse-mount-lookup.c",
+    "patches/fuse-overlay-mount.patch", "tests/upstream/mount_propagation_test.go",
+    "tests/runtime/fuse-overlay-mount.c", "tests/runtime/fuse-overlay-mounts.sh",
     "tests/runtime/sysfs_oracle.py", "tests/static/test_sysfs_oracle.py",
     "tests/static/test_proc_verifier.py", "tests/unit/proc-verifier.c",
  "tests/upstream/fuse_container_test.go", "tests/upstream/sysfs_dentry_test.go", "tests/runtime/sysfs-dentry-protection.py",
@@ -109,7 +115,7 @@ class Contracts(unittest.TestCase):
         included = {rule[1:] for rule in rules[1:] if rule.startswith("!")}
         copied = set(re.findall(r"^COPY (?!\-\-)(\S+) ",
                                 (ROOT / "build/Dockerfile").read_text(), re.M))
-        self.assertEqual(copied, {"tests/upstream/fuse_container_test.go", "tests/upstream/sysfs_dentry_test.go", "helper/sysfs-mount-helper.c", "patches/sysfs-transfer.patch", "tests/upstream/sysfs_policy_test.go", "tests/upstream/sysfs_snapshot_test.go", "tests/upstream/sysfs_metadata_test.go", "tests/upstream/fuse_identity_test.go", "helper/proc-mount-helper.c", "patches/proc-transfer.patch", "tests/upstream/proc_policy_test.go", "tests/unit/lifecycle.c"})
+        self.assertEqual(copied, {"tests/upstream/fuse_mount_target_test.go","helper/fuse-mount-lookup.h","patches/fuse-overlay-mount.patch", "tests/upstream/mount_propagation_test.go", "tests/upstream/fuse_container_test.go", "tests/upstream/sysfs_dentry_test.go", "helper/sysfs-mount-helper.c", "patches/sysfs-transfer.patch", "tests/upstream/sysfs_policy_test.go", "tests/upstream/sysfs_snapshot_test.go", "tests/upstream/sysfs_metadata_test.go", "tests/upstream/fuse_identity_test.go", "helper/proc-mount-helper.c", "patches/proc-transfer.patch", "tests/upstream/proc_policy_test.go", "tests/unit/lifecycle.c"})
         expected = copied | {"build/Dockerfile", "build/", "helper/", "patches/", "tests/", "tests/upstream/", "tests/unit/"}
         self.assertEqual(included, expected)
         self.assertTrue(all(not any(c in rule for c in "*?") for rule in included))
@@ -117,6 +123,8 @@ class Contracts(unittest.TestCase):
 
     def test_script_syntax(self):
         subprocess.run(["bash", "-n", str(ROOT / "tests/runtime/verify.sh")], check=True)
+        for probe in ("fuse-overlay-mounts.sh", "fuse-docker-build.sh"):
+            subprocess.run(["sh", "-n", str(ROOT / "tests/runtime" / probe)], check=True)
         for name in PUBLIC_FILES:
             if name.endswith(".py"):
                 ast.parse((ROOT / name).read_text(), filename=name)
@@ -142,6 +150,10 @@ class Contracts(unittest.TestCase):
                                  ("tests/runtime/verify.c", "verify")):
                 subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror",
                                 str(ROOT / source), "-o", str(Path(work) / name)], check=True)
+            fixture = Path(work) / "fuse-lookup"
+            subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
+                            str(ROOT / "tests/unit/fuse-mount-lookup.c"), "-o", str(fixture)], check=True)
+            subprocess.run([str(fixture)], check=True, timeout=5)
             # No inherited contract FDs: direct invocation is unauthorized, even under root.
             result = subprocess.run([str(Path(work) / "helper"), "0", "0", "0"],
                                     close_fds=True, capture_output=True, timeout=5)
