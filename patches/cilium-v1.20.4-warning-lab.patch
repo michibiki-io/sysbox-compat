@@ -1,0 +1,283 @@
+diff --git a/pkg/datapath/loader/netlink.go b/pkg/datapath/loader/netlink.go
+index d6e38c2f..1c2d630f 100644
+--- a/pkg/datapath/loader/netlink.go
++++ b/pkg/datapath/loader/netlink.go
+@@ -9,11 +9,15 @@ import (
+ 	"log/slog"
+ 	"math"
+ 	"net"
++	"os"
++	"path/filepath"
+ 
+ 	"github.com/cilium/ebpf"
++	"github.com/cilium/ebpf/link"
+ 	"github.com/vishvananda/netlink"
+ 	"golang.org/x/sys/unix"
+ 
++	"github.com/cilium/cilium/pkg/bpf"
+ 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
+ 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
+ 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
+@@ -526,21 +530,32 @@ func renameDevice(from, to string) error {
+ //
+ // If checkEgress is true, returns true if there's both an ingress and
+ // egress program attached.
+-func DeviceHasSKBProgramLoaded(device string, checkEgress bool) (bool, error) {
+-	link, err := safenetlink.LinkByName(device)
++func DeviceHasSKBProgramLoaded(device, endpointID string, checkEgress bool) (bool, error) {
++	iface, err := safenetlink.LinkByName(device)
+ 	if err != nil {
+ 		return false, fmt.Errorf("retrieving device %s: %w", device, err)
+ 	}
+ 
+-	itcx, err := hasCiliumTCXLinks(link, ebpf.AttachTCXIngress)
++	if option.Config.EnableTCX && iface.Type() == "veth" {
++		switch {
++		case endpointID != "":
++			pinDir := filepath.Join(bpffsEndpointsDir(bpf.CiliumPath()), endpointID, "links")
++			return pinnedTCXProgramsPresent(iface, pinDir, symbolFromEndpoint, symbolToEndpoint, checkEgress)
++		case device == defaults.HostDevice:
++			pinDir := bpffsDeviceLinksDir(bpf.CiliumPath(), iface)
++			return pinnedTCXProgramsPresent(iface, pinDir, symbolToHostEp, symbolFromHostEp, checkEgress)
++		}
++	}
++
++	itcx, err := hasCiliumTCXLinks(iface, ebpf.AttachTCXIngress)
+ 	if err != nil {
+ 		return false, fmt.Errorf("failed to check for cilium tcx links on ingress: %w", err)
+ 	}
+-	itc, err := hasCiliumTCFilters(link, netlink.HANDLE_MIN_INGRESS)
++	itc, err := hasCiliumTCFilters(iface, netlink.HANDLE_MIN_INGRESS)
+ 	if err != nil {
+ 		return false, fmt.Errorf("failed to check for cilium tc filters on ingress: %w", err)
+ 	}
+-	ink, err := hasCiliumNetkitLinks(link, ebpf.AttachNetkitPeer)
++	ink, err := hasCiliumNetkitLinks(iface, ebpf.AttachNetkitPeer)
+ 	if err != nil {
+ 		return false, fmt.Errorf("failed to check for cilium netkit links: %w", err)
+ 	}
+@@ -554,18 +569,48 @@ func DeviceHasSKBProgramLoaded(device string, checkEgress bool) (bool, error) {
+ 		return true, nil
+ 	}
+ 
+-	etcx, err := hasCiliumTCXLinks(link, ebpf.AttachTCXEgress)
++	etcx, err := hasCiliumTCXLinks(iface, ebpf.AttachTCXEgress)
+ 	if err != nil {
+ 		return false, fmt.Errorf("failed to check for cilium tcx links on egress: %w", err)
+ 	}
+-	etc, err := hasCiliumTCFilters(link, netlink.HANDLE_MIN_EGRESS)
++	etc, err := hasCiliumTCFilters(iface, netlink.HANDLE_MIN_EGRESS)
+ 	if err != nil {
+ 		return false, fmt.Errorf("failed to check for cilium tc filters on egress: %w", err)
+ 	}
+-	enk, err := hasCiliumNetkitLinks(link, ebpf.AttachNetkitPrimary)
++	enk, err := hasCiliumNetkitLinks(iface, ebpf.AttachNetkitPrimary)
+ 	if err != nil {
+ 		return false, fmt.Errorf("failed to check for cilium netkit links on primary: %w", err)
+ 	}
+ 
+ 	return etc || etcx || enk, nil
+ }
++
++func pinnedTCXProgramsPresent(iface netlink.Link, pinDir, ingress, egress string, checkEgress bool) (bool, error) {
++	loaded, err := endpointTCXHookPresent(iface, pinDir, ingress, netlink.HANDLE_MIN_INGRESS)
++	if err != nil || !loaded || !checkEgress {
++		return loaded, err
++	}
++	return endpointTCXHookPresent(iface, pinDir, egress, netlink.HANDLE_MIN_EGRESS)
++}
++
++// endpointTCXHookPresent checks the link pinned by the loader for this endpoint.
++// A detached TCX link can remain pinned, but the kernel clears its ifindex.
++func endpointTCXHookPresent(iface netlink.Link, dir, program string, parent uint32) (bool, error) {
++	pin := filepath.Join(dir, program)
++	pinned, err := link.LoadPinnedLink(pin, nil)
++	if errors.Is(err, os.ErrNotExist) {
++		// attachSKBProgram can fall back to legacy tc.
++		return hasCiliumTCFilters(iface, parent)
++	}
++	if err != nil {
++		return false, fmt.Errorf("opening endpoint link %s: %w", pin, err)
++	}
++	defer pinned.Close()
++	info, err := pinned.Info()
++	if err != nil {
++		return false, fmt.Errorf("reading endpoint link %s: %w", pin, err)
++	}
++	tcx := info.TCX()
++	return tcx != nil && ebpf.AttachType(tcx.AttachType) == parentToAttachType(parent) &&
++		tcx.Ifindex == uint32(iface.Attrs().Index) && info.Program != 0, nil
++}
+diff --git a/pkg/datapath/sockets/sockets.go b/pkg/datapath/sockets/sockets.go
+index 5c34fa91..e789f6a1 100644
+--- a/pkg/datapath/sockets/sockets.go
++++ b/pkg/datapath/sockets/sockets.go
+@@ -332,13 +332,16 @@ func (sd *bpfSocketDestroyer) Destroy(logger *slog.Logger, f SocketFilter) error
+ // supported, it falls back to a Netlink-based strategy based on sock_diag.
+ //
+ // sockRevNat4 and sockRevNat6 must be provided to use the BPF-based strategy;
+-// otherwise, initialization falls back to Netlink.
+-func NewSocketDestroyer(l *slog.Logger, sockRevNat4, sockRevNat6 *bpf.Map) (SocketDestroyer, error) {
++// otherwise, initialization falls back to Netlink. If the Netlink probe succeeded,
++// a permission error during BPF initialization also permits the fallback.
++func NewSocketDestroyer(l *slog.Logger, sockRevNat4, sockRevNat6 *bpf.Map, netlinkAvailable bool) (SocketDestroyer, error) {
+ 	if sockRevNat4 != nil || sockRevNat6 != nil {
+ 		l.Info("Creating BPF socket destroyer")
+ 		bpfSD, err := newBPFSocketDestroyer(l, sockRevNat4, sockRevNat6)
+ 		if errors.Is(err, ebpf.ErrNotSupported) {
+ 			l.Info("bpf_sock_destroy is not supported on the current kernel. Falling back to netlink-based socket destroyer")
++		} else if netlinkAvailable && (errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
++			l.Info("BPF socket destroyer unavailable with current permissions. Falling back to netlink", logfields.Error, err)
+ 		} else if err != nil {
+ 			return nil, fmt.Errorf("creating BPF socket destroyer: %w", err)
+ 		} else {
+diff --git a/pkg/endpoint/watchdog/ep-bpfprog-watchdog.go b/pkg/endpoint/watchdog/ep-bpfprog-watchdog.go
+index 9353d513..7fea017a 100644
+--- a/pkg/endpoint/watchdog/ep-bpfprog-watchdog.go
++++ b/pkg/endpoint/watchdog/ep-bpfprog-watchdog.go
+@@ -14,6 +14,7 @@ import (
+ 
+ 	"github.com/cilium/cilium/pkg/datapath/loader"
+ 	"github.com/cilium/cilium/pkg/endpoint"
++	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+ 	"github.com/cilium/cilium/pkg/endpoint/types"
+ 	"github.com/cilium/cilium/pkg/endpointmanager"
+ 	"github.com/cilium/cilium/pkg/endpointstate"
+@@ -43,7 +44,6 @@ type epBPFProgWatchdogParams struct {
+ 	RestorerPromise promise.Promise[endpointstate.Restorer]
+ 
+ 	EndpointManager endpointmanager.EndpointManager
+-	Orchestrator    types.Orchestrator
+ }
+ 
+ // Cell triggers a job to ensure device tc programs remain loaded.
+@@ -65,7 +65,6 @@ func registerEndpointBPFProgWatchdog(p epBPFProgWatchdogParams) {
+ 	watchdog := &endpointBPFProgWatchdog{
+ 		logger:          p.Logger,
+ 		endpointManager: p.EndpointManager,
+-		orchestrator:    p.Orchestrator,
+ 	}
+ 
+ 	p.JobGroup.Add(job.OneShot("wait-for-endpoint-restore", func(ctx context.Context, _ cell.Health) error {
+@@ -90,12 +89,12 @@ type endpointBPFProgWatchdog struct {
+ 	logger *slog.Logger
+ 
+ 	endpointManager endpointmanager.EndpointManager
+-	orchestrator    types.Orchestrator
+ }
+ 
+ func (r *endpointBPFProgWatchdog) checkEndpointBPFPrograms(ctx context.Context) error {
+ 	eps := r.endpointManager.GetEndpoints()
+ 	epsWithoutProgramsLoaded := map[uint16]string{}
++	var missing []*endpoint.Endpoint
+ 
+ 	for _, ep := range eps {
+ 		if ep.GetState() != endpoint.StateReady {
+@@ -107,7 +106,11 @@ func (r *endpointBPFProgWatchdog) checkEndpointBPFPrograms(ctx context.Context)
+ 			continue
+ 		}
+ 
+-		loaded, err := loader.DeviceHasSKBProgramLoaded(ep.HostInterface(), ep.RequireEgressProg())
++		endpointID := ""
++		if !ep.IsHost() {
++			endpointID = ep.StringID()
++		}
++		loaded, err := loader.DeviceHasSKBProgramLoaded(ep.HostInterface(), endpointID, ep.RequireEgressProg())
+ 		if err != nil {
+ 			r.logger.Warn("Unable to assert if endpoint BPF programs need to be reloaded",
+ 				logfields.Endpoint, ep.HostInterface(),
+@@ -126,6 +129,7 @@ func (r *endpointBPFProgWatchdog) checkEndpointBPFPrograms(ctx context.Context)
+ 		// Otherwise, we will false warn of programs being unloaded.
+ 		if !loaded && ep.IsAlive() {
+ 			epsWithoutProgramsLoaded[ep.ID] = ep.GetK8sNamespaceAndCEPName()
++			missing = append(missing, ep)
+ 		}
+ 	}
+ 
+@@ -138,9 +142,23 @@ func (r *endpointBPFProgWatchdog) checkEndpointBPFPrograms(ctx context.Context)
+ 			logfields.Total, len(eps),
+ 		)
+ 
+-		if err := r.orchestrator.Reinitialize(ctx); err != nil {
+-			r.logger.Error("Failed to reload Cilium endpoints BPF programs", logfields.Error, err)
+-			return fmt.Errorf("failed to reload Cilium endpoints BPF programs: %w", err)
++		// A node reinitialization can be skipped when the node configuration
++		// is unchanged. Reload the datapath for the affected endpoints directly.
++		for _, ep := range missing {
++			done := ep.RegenerateIfAlive(&regeneration.ExternalRegenerationMetadata{
++				Reason:            regeneration.ReasonDeviceConfigurationChanged,
++				Message:           "Endpoint BPF attachment missing",
++				RegenerationLevel: regeneration.RegenerateWithDatapath,
++				ParentContext:     ctx,
++			})
++			select {
++			case <-ctx.Done():
++				return ctx.Err()
++			case ok := <-done:
++				if !ok && ep.IsAlive() {
++					return fmt.Errorf("failed to reload BPF programs for endpoint %d", ep.ID)
++				}
++			}
+ 		}
+ 	}
+ 
+diff --git a/pkg/loadbalancer/reconciler/termination.go b/pkg/loadbalancer/reconciler/termination.go
+index e77ce135..3fd14ee5 100644
+--- a/pkg/loadbalancer/reconciler/termination.go
++++ b/pkg/loadbalancer/reconciler/termination.go
+@@ -90,11 +90,11 @@ type netnsOps struct {
+ // Provide()ed above, since the invocation of NewSocketDestroyer must be
+ // deferred until all maps are created. We want to run it right before
+ // socketTerminationLoop is invoked.
+-type socketDestroyerFactory func(socketTerminationParams) (sockets.SocketDestroyer, error)
++type socketDestroyerFactory func(socketTerminationParams, bool) (sockets.SocketDestroyer, error)
+ 
+-func makeSocketDestroyer(p socketTerminationParams) (sockets.SocketDestroyer, error) {
++func makeSocketDestroyer(p socketTerminationParams, netlinkAvailable bool) (sockets.SocketDestroyer, error) {
+ 	sockRevNat4, sockRevNat6 := p.LBMaps.SockRevNat()
+-	sd, err := sockets.NewSocketDestroyer(p.Log, sockRevNat4, sockRevNat6)
++	sd, err := sockets.NewSocketDestroyer(p.Log, sockRevNat4, sockRevNat6, netlinkAvailable)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -107,7 +107,8 @@ func registerSocketTermination(p socketTerminationParams) error {
+ 		return nil
+ 	}
+ 
+-	if err := sockets.InetDiagDestroyEnabled(p.Log, p.Config.LBSockTerminateAllProtos, true); err != nil {
++	netlinkErr := sockets.InetDiagDestroyEnabled(p.Log, p.Config.LBSockTerminateAllProtos, true)
++	if err := netlinkErr; err != nil {
+ 		if errors.Is(err, probes.ErrNotSupported) {
+ 			// The kernel doesn't support socket termination.
+ 			p.Log.Error("Forcefully terminating sockets connected to deleted service backends "+
+@@ -125,7 +126,7 @@ func registerSocketTermination(p socketTerminationParams) error {
+ 		job.OneShot(
+ 			"socket-termination",
+ 			func(ctx context.Context, h cell.Health) error {
+-				sd, err := p.MakeSocketDestroyer(p)
++				sd, err := p.MakeSocketDestroyer(p, netlinkErr == nil)
+ 				if err != nil {
+ 					return fmt.Errorf("creating socket destroyer: %w", err)
+ 				}
+diff --git a/pkg/loadbalancer/reconciler/termination_test.go b/pkg/loadbalancer/reconciler/termination_test.go
+index 03e2496d..1607303e 100644
+--- a/pkg/loadbalancer/reconciler/termination_test.go
++++ b/pkg/loadbalancer/reconciler/termination_test.go
+@@ -80,7 +80,7 @@ func testSocketTermination(t *testing.T, hostOnly bool) {
+ 			loadbalancer.NewFrontendsTable,
+ 			statedb.RWTable[*loadbalancer.Frontend].ToTable,
+ 			func() socketDestroyerFactory {
+-				return func(p socketTerminationParams) (sockets.SocketDestroyer, error) {
++				return func(p socketTerminationParams, _ bool) (sockets.SocketDestroyer, error) {
+ 					return mock, nil
+ 				}
+ 			},
+@@ -331,7 +331,7 @@ func TestPrivilegedSocketTermination_Datapath(t *testing.T) {
+ 		},
+ 	}
+ 
+-	sd, err := sockets.NewSocketDestroyer(log, nil, nil)
++	sd, err := sockets.NewSocketDestroyer(log, nil, nil, true)
+ 	require.NoError(t, err)
+ 
+ 	lbmap.UpdateSockRevNat(uint64(cookie), net.IP{127, 0, 0, 1}, 30000, 0)

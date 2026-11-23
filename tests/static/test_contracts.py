@@ -15,6 +15,7 @@ build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 PUBLIC_FILES = {
     "patches/cilium-bpf-lab.patch", "scripts/build-cilium-lab.py",
+    "patches/cilium-v1.20.4-warning-lab.patch",
     "tests/runtime/cilium-lab-perf.c", "tests/runtime/cilium-lab-perf.py", "docs/cilium-lab.md",
     "tests/runtime/buildkit-fuse-bind.patch",
     "tests/runtime/fuse-docker-build.sh", "tests/runtime/fuse-verify-spdx.py",
