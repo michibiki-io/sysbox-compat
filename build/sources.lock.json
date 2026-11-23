@@ -29,7 +29,7 @@
   "generator": "github.com/golang/protobuf/protoc-gen-go@v1.3.5",
   "schema_version": 1,
   "source_sha256": {
-    "docs/cilium-lab.md": "a995578c565dbc73d1e99b7f9f01656afc55e8008922eb5f0084b092467cf5ff",
+    "docs/cilium-lab.md": "9da08e0c2434fb267178408e77552c8700a5ef3b52de0517f7f78ffc23b8db5a",
     "docs/compatibility.md": "7bfc6ebee2462f06273392537f792a9beebdc7a48696c2e5883c5988446ac213",
     "helper/fuse-mount-lookup.h": "6f77ae66c662c511bddadbf487f5c4f652433f4f4f8f1522c8ae6fe7985ef930",
     "helper/proc-mount-helper.c": "aba64dfae89810f9ba08de7c94f1aae5745c26821446db81de7528f719d6e3fb",

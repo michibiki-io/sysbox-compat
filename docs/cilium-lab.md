@@ -118,18 +118,21 @@ BPF token and perf/JIT authorization.
   its original backend while keeping that Pod alive. Verify that its original
   connected socket is aborted and the other Service's connected client still
   receives responses. Require the Agent to log selection of the existing
-  Netlink implementation after BPF initialization was denied.
+  Netlink implementation after BPF initialization returned `EPERM`. The
+  additional fallback leaves `EACCES` as an error.
 
-On amd64, Linux 6.18.44 and Sysbox 0.7.1, the two checks and the five original
-catalog network tests completed in 251.78 seconds. The TCX check exercised veth
-endpoints. Socket termination through the Service reconciler was observed
-for UDP. The standard Sysbox release recipe does not consume this patch.
+On amd64, Linux 6.18.44 and Sysbox 0.7.1, the watchdog installed a different
+TCX link ID at the same ifindex on both kind nodes, and connectivity recovered.
+The Service reconciler terminated the target UDP socket while the control
+connection and old backend Pod stayed up. All seven tests passed in 254.51 seconds. The TCX
+check exercised veth endpoints. The standard Sysbox release recipe does not
+consume this patch.
 
 | Trial evidence | SHA-256 |
 | --- | --- |
-| Cilium source patch | `1c43664e15410af216dfe0fefa8b2a34f3fd9373c6854d9f218b30e8e590e746` |
-| Built Cilium Agent exercised on both nodes | `cef56243d3a0579816f1334cb0b428647a82a1e2e92dc5ead82ee796ff69fd5d` |
-| Local test log | `a574a6b66ea4d47248401405abaea7f51dcba038121afa78d07267291b8c4add` |
+| Cilium source patch | `c9918be5c8a4d4afa256ae9838b0fa2c3878805cc5dcfe50d3dc1850c04cac74` |
+| Built Cilium Agent exercised on both nodes | `2a2d95582e0eca8e52e98e24db87fc0da22dcae614f4528fc55feaf0edf14364` |
+| Local test log | `07fa6914393d0238d7145a5fe74899b8a4a3a6d486327a671a84e6aeff66c034` |
 
 ## 日本語
 
@@ -179,10 +182,11 @@ VTEP、GitOps の各出力で同じ Agent を参照しました。
   テスト用 veth endpoint のピンを外し、watchdog が同じ ifindex に別の
   リンクを作って通信が戻ることを両ノードで確認しました。
 - ソケット終了処理は、Netlink の機能プローブが成功し、BPF の初期化で
-  権限エラーになった場合に、既存の Netlink 実装に切り替えます。
+  `EPERM` になった場合に、既存の Netlink 実装に切り替えます。
+  `EACCES` は従来どおりエラーとして返します。
   Service のバックエンドを外すと、元の Pod は稼働したまま既存 UDP
   ソケットが終了し、対照の通信が続くことを確認しました。
 
 amd64、Linux 6.18.44、Sysbox 0.7.1 の使い捨て環境で、上記 2 件と
-既存のカタログネットワークテスト 5 件が通りました。実行時間は 251.78 秒です。
+既存のカタログネットワークテスト 5 件が通りました。実行時間は 254.51 秒です。
 TCX の実機検証は veth、Service 経由のソケット終了の実機検証は UDP が対象です。
