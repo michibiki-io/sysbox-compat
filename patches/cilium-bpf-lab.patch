@@ -54,7 +54,7 @@
  
 --- /dev/null
 +++ b/sysbox-fs/seccomp/perf_output_lab.go
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,188 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package seccomp
@@ -232,6 +232,9 @@
 +		return t.createErrorResponse(req.ID, errno)
 +	}
 +	defer unix.Close(int(fd))
++	if perfCallerScope(req.Pid, cntrID) != scope {
++		return deny
++	}
 +	reply := perfOutputAddFD{ID: req.ID, Flags: notifAddFDSend, SrcFD: uint32(fd), NewFDFlags: unix.O_CLOEXEC}
 +	_, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(listener), ioctlNotifAddFD, uintptr(unsafe.Pointer(&reply)))
 +	runtime.KeepAlive(&reply)
@@ -242,7 +245,7 @@
 +}
 --- /dev/null
 +++ b/sysbox-fs/seccomp/jit_info_lab.go
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,145 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package seccomp
@@ -354,6 +357,25 @@
 +	if errno != 0 || !valid() {
 +		return continueInKernel
 +	}
++	reply := ciliumJITProbeReply(info, int(length), translatedRequest)
++	if reply == nil || perfCallerScope(req.Pid, cntrID) == "" || !valid() {
++		return continueInKernel
++	}
++
++	err = t.memParser.WriteSyscallBytesArgs(req.Pid, []memParserDataElem{{addr: address, size: int(length), data: reply}})
++	if err != nil {
++		return t.createErrorResponse(req.ID, syscall.EFAULT)
++	}
++	return &sysResponse{ID: req.ID}
++}
++
++// Construct only the scalar response for a known program. The caller must
++// verify the notification and scope before writing this to tracee memory.
++func ciliumJITProbeReply(info [24]byte, length int, translatedRequest bool) []byte {
++	if length < 40 || length > 512 {
++		return nil
++	}
++	order := binary.NativeEndian
 +	kind := order.Uint32(info[0:4])
 +	reply := make([]byte, length)
 +	switch {
@@ -364,15 +386,10 @@
 +		order.Uint32(info[20:24]) != 0:
 +		copy(reply[:16], info[:16])
 +		copy(reply[20:24], info[20:24])
-+		// The zero instruction pointer signals a restricted kernel to ebpf-go.
 +	default:
-+		return continueInKernel
++		return nil
 +	}
-+	err = t.memParser.WriteSyscallBytesArgs(req.Pid, []memParserDataElem{{addr: address, size: int(length), data: reply}})
-+	if err != nil {
-+		return t.createErrorResponse(req.ID, syscall.EFAULT)
-+	}
-+	return &sysResponse{ID: req.ID}
++	return reply
 +}
 --- /dev/null
 +++ b/sysbox-fs/seccomp/perf_output_lab_test.go
@@ -425,5 +442,55 @@
 +	}
 +	if perfOutputAttr(attr[:56]) || perfOutputAttr(append(attr, make([]byte, 16)...)) {
 +		t.Fatal("unsupported perf_event_attr sizes accepted")
++	}
++}
+--- /dev/null
++++ b/sysbox-fs/seccomp/jit_info_lab_test.go
+@@ -0,0 +1,47 @@
++package seccomp
++
++import (
++	"bytes"
++	"encoding/binary"
++	"testing"
++)
++
++func TestCiliumJITProbeReply(t *testing.T) {
++	order := binary.NativeEndian
++	for _, test := range []struct {
++		name       string
++		kind       uint32
++		tag        [32]byte
++		translated bool
++		length     int
++		want       bool
++	}{
++		{"socket filter", socketFilterType, ciliumJITProbeTag, false, 16, true},
++		{"XDP", xdpProgramType, ciliumDeadCodeProbeTag, true, 20, true},
++		{"other tag", xdpProgramType, [32]byte{}, true, 20, false},
++		{"other program type", 3, ciliumJITProbeTag, false, 16, false},
++		{"socket filter raw request", socketFilterType, ciliumJITProbeTag, true, 16, false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			var info [24]byte
++			order.PutUint32(info[:4], test.kind)
++			order.PutUint32(info[4:8], 42)
++			copy(info[8:16], test.tag[:8])
++			order.PutUint32(info[16:20], 128)
++			order.PutUint32(info[20:24], 64)
++			reply := ciliumJITProbeReply(info, 256, test.translated)
++			if !test.want {
++				if reply != nil {
++					t.Fatal("unexpected experimental response")
++				}
++				return
++			}
++			want := make([]byte, 256)
++			copy(want[:16], info[:16])
++			copy(want[test.length:test.length+4], info[test.length:test.length+4])
++			if !bytes.Equal(reply, want) {
++				t.Fatal("response differs from permitted scalar fields")
++			}
++		})
 +	}
 +}
