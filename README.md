@@ -79,6 +79,7 @@ CI runs focused checks and a native container build from public inputs. It does 
 - [Design](docs/design.md): procfs transfer flow and the internal daemon/helper contract.
 - [Security model](docs/security-model.md): authorization, namespace isolation and registered procfs protections.
 - [Compatibility](docs/compatibility.md): validated conditions, review correction checks and remaining limitations.
+- [Cilium compatibility experiment](docs/cilium-lab.md)
 
 ### License
 
@@ -205,6 +206,7 @@ CI は静的検査と、公開されている入力からのネイティブコ�
 - [設計](docs/design.md)：procfs 転送の流れとデーモン/helper 間の内部契約。
 - [安全性の設計](docs/security-model.md)：認証、名前空間の隔離、登録済みの procfs 保護。
 - [動作条件](docs/compatibility.md)：検証済みの条件、レビュー修正の検査、残る制約。
+- [Cilium 互換性の試験](docs/cilium-lab.md)
 
 ### ライセンス
 

@@ -245,7 +245,7 @@
 +}
 --- /dev/null
 +++ b/sysbox-fs/seccomp/jit_info_lab.go
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,170 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package seccomp
@@ -315,13 +315,8 @@
 +	if err != nil || len(buffer) != 1 || len(buffer[0]) != int(length) {
 +		return continueInKernel
 +	}
-+	request := []byte(buffer[0])
-+	translatedRequest := order.Uint32(request[20:24]) != 0 && order.Uint64(request[32:40]) != 0
-+	if translatedRequest {
-+		clear(request[20:24])
-+		clear(request[32:40])
-+	}
-+	if !bytes.Equal(request, make([]byte, length)) {
++	translatedRequest, permitted := ciliumJITProbeRequest([]byte(buffer[0]))
++	if !permitted {
 +		return continueInKernel
 +	}
 +	pidfd, err := openProcRequesterPidfd(int(req.Pid), unix.PidfdOpen)
@@ -358,15 +353,45 @@
 +		return continueInKernel
 +	}
 +	reply := ciliumJITProbeReply(info, int(length), translatedRequest)
-+	if reply == nil || perfCallerScope(req.Pid, cntrID) == "" || !valid() {
++	if reply == nil {
 +		return continueInKernel
 +	}
 +
-+	err = t.memParser.WriteSyscallBytesArgs(req.Pid, []memParserDataElem{{addr: address, size: int(length), data: reply}})
++	// Pin the requester's address space before the final notification check.
++	// A later write must not reopen a numeric TID that may have been reused.
++	mem, err := unix.Open(fmt.Sprintf("/proc/%d/mem", req.Pid), unix.O_WRONLY|unix.O_CLOEXEC, 0)
 +	if err != nil {
++		return continueInKernel
++	}
++	defer unix.Close(mem)
++	if perfCallerScope(req.Pid, cntrID) == "" || !valid() {
++		return continueInKernel
++	}
++	written, err := unix.Pwrite(mem, reply, int64(address))
++	if err != nil || written != len(reply) {
 +		return t.createErrorResponse(req.ID, syscall.EFAULT)
 +	}
 +	return &sysResponse{ID: req.ID}
++}
++
++func ciliumJITProbeRequest(request []byte) (translated, permitted bool) {
++	if len(request) < 40 || len(request) > 512 {
++		return false, false
++	}
++	order := binary.NativeEndian
++	length := order.Uint32(request[20:24])
++	pointer := order.Uint64(request[32:40])
++	if (length == 0) != (pointer == 0) {
++		return false, false
++	}
++	for _, part := range [][]byte{request[:20], request[24:32], request[40:]} {
++		for _, value := range part {
++			if value != 0 {
++				return false, false
++			}
++		}
++	}
++	return length != 0, true
 +}
 +
 +// Construct only the scalar response for a known program. The caller must
@@ -446,7 +471,7 @@
 +}
 --- /dev/null
 +++ b/sysbox-fs/seccomp/jit_info_lab_test.go
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,74 @@
 +package seccomp
 +
 +import (
@@ -454,6 +479,33 @@
 +	"encoding/binary"
 +	"testing"
 +)
++
++func TestCiliumJITProbeRequest(t *testing.T) {
++	for _, test := range []struct {
++		name           string
++		set            []int
++		wantTranslated bool
++		wantPermitted  bool
++	}{
++		{"empty", nil, false, true},
++		{"translated details", []int{20, 32}, true, true},
++		{"length only", []int{20}, false, false},
++		{"buffer only", []int{32}, false, false},
++		{"JIT instruction buffer", []int{24}, false, false},
++		{"map IDs buffer", []int{56}, false, false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			request := make([]byte, 256)
++			for _, index := range test.set {
++				request[index] = 1
++			}
++			translated, permitted := ciliumJITProbeRequest(request)
++			if translated != test.wantTranslated || permitted != test.wantPermitted {
++				t.Fatalf("got translated=%t permitted=%t", translated, permitted)
++			}
++		})
++	}
++}
 +
 +func TestCiliumJITProbeReply(t *testing.T) {
 +	order := binary.NativeEndian

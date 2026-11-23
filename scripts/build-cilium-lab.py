@@ -34,7 +34,7 @@ apt-get install -y -qq --no-install-recommends gcc libc6-dev make protobuf-compi
 go install "$1"
 make -C sysbox-ipc sysbox-ipc
 cd sysbox-fs
-CGO_ENABLED=1 go test -tags 'netgo osusergo' ./seccomp -run '^Test(PerfOutputLab|CiliumJITProbeReply)' -count=1 -v
+CGO_ENABLED=1 go test -tags 'netgo osusergo' ./seccomp -run '^Test(PerfOutputLab|CiliumJITProbe)' -count=1 -v
 CGO_ENABLED=1 go build -buildvcs=false -trimpath -tags 'netgo osusergo' -ldflags "-linkmode external -extldflags -static -X main.version=0.7.1-cilium-lab -X main.commitId=$2" -o /output/sysbox-fs ./cmd/sysbox-fs
 cd ../sysbox-runc
 CGO_ENABLED=1 go build -buildvcs=false -trimpath -tags 'seccomp apparmor idmapped_mnt netgo osusergo' -ldflags "-linkmode external -extldflags -static -X main.version=0.7.1-cilium-lab -X main.commitId=$3" -o /output/sysbox-runc .

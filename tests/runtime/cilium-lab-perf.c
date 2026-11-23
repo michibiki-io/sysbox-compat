@@ -1,11 +1,16 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/bpf.h>
 #include <linux/perf_event.h>
 #include <sched.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -41,16 +46,110 @@ static int probe(int invalid)
     return valid ? 0 : -1;
 }
 
-int main(void)
+/* The host supplies only this fixed, unattached feature probe. */
+static int send_jit_fd(int socket_fd)
 {
+    struct bpf_insn program[] = {{.code = 0xb7}, {.code = 0x95}};
+    union bpf_attr load = {
+        .prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
+        .insn_cnt = sizeof(program) / sizeof(program[0]),
+        .insns = (uintptr_t)program,
+        .license = (uintptr_t)"Apache-2.0",
+    };
+    int prog = (int)syscall(SYS_bpf, BPF_PROG_LOAD, &load, sizeof(load));
+    if (prog < 0) {
+        perror("load sandbox test probe");
+        return 2;
+    }
+    char data = 'J';
+    struct iovec iov = {.iov_base = &data, .iov_len = sizeof(data)};
+    union {
+        struct cmsghdr align;
+        char bytes[CMSG_SPACE(sizeof(prog))];
+    } control = {0};
+    struct msghdr msg = {
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes),
+    };
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(prog));
+    memcpy(CMSG_DATA(cmsg), &prog, sizeof(prog));
+    int ret = sendmsg(socket_fd, &msg, 0) == 1 ? 0 : 2;
+    close(prog);
+    return ret;
+}
+
+static int receive_jit_fd(void)
+{
+    struct sockaddr_un address = {.sun_family = AF_UNIX, .sun_path = "/jit-probe.sock"};
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0)
+        return -1;
+    int prog = -1;
+    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) == 0) {
+        char value;
+        struct iovec iov = {.iov_base = &value, .iov_len = sizeof(value)};
+        union {
+            struct cmsghdr align;
+            char bytes[CMSG_SPACE(sizeof(prog))];
+        } control = {0};
+        struct msghdr msg = {
+            .msg_iov = &iov, .msg_iovlen = 1,
+            .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes),
+        };
+        if (recvmsg(socket_fd, &msg, MSG_CMSG_CLOEXEC) == 1 && value == 'J') {
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+            if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+                cmsg->cmsg_len == CMSG_LEN(sizeof(prog)))
+                memcpy(&prog, CMSG_DATA(cmsg), sizeof(prog));
+        }
+    }
+    close(socket_fd);
+    return prog;
+}
+
+static int jit_probe(int prog)
+{
+    struct bpf_prog_info info = {0};
+    union bpf_attr query = {
+        .info.bpf_fd = prog,
+        .info.info_len = sizeof(info),
+        .info.info = (uintptr_t)&info,
+    };
+    if (syscall(SYS_bpf, BPF_OBJ_GET_INFO_BY_FD, &query, sizeof(query)) != 0 ||
+        info.type != BPF_PROG_TYPE_SOCKET_FILTER || info.jited_prog_insns != 0 ||
+        info.xlated_prog_insns != 0)
+        return -1;
+    return (int)info.jited_prog_len;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 3 && strcmp(argv[1], "--send-jit-fd") == 0)
+        return send_jit_fd(atoi(argv[2]));
+    if (argc != 1)
+        return 2;
+    int prog = receive_jit_fd();
+    if (prog < 0)
+        return 2;
     char command[32];
     while (fgets(command, sizeof(command), stdin)) {
-        int invalid = strcmp(command, "out-of-policy\n") == 0;
-        if (!invalid && strcmp(command, "probe\n") != 0)
+        int value;
+        if (strcmp(command, "jit\n") == 0) {
+            value = jit_probe(prog);
+        } else if (strcmp(command, "probe\n") == 0) {
+            value = probe(0);
+        } else if (strcmp(command, "out-of-policy\n") == 0) {
+            value = probe(1);
+        } else {
             return 2;
-        printf("%d\n", probe(invalid));
+        }
+        printf("%d\n", value);
         if (fflush(stdout) != 0)
             return 2;
     }
+    close(prog);
     return ferror(stdin) ? 2 : 0;
 }
