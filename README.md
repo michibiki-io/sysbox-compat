@@ -1,4 +1,4 @@
-# Sysbox Compatibility / Sysbox 互換性
+# Sysbox Compat
 
 ## Table of Contents / 目次
 
